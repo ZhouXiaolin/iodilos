@@ -21,6 +21,7 @@ pub mod noderef;
 pub mod reactive;
 pub mod render;
 pub mod style;
+pub mod text;
 pub mod view;
 
 /// Re-export of the reactive primitives (vendored from `sycamore-reactive`).

@@ -210,6 +210,33 @@ impl Canvas {
         }
     }
 
+    /// Paint one row of styled segments at row `y`, starting at column
+    /// `rect.x`, clipping to `rect.width`. No wrapping — the caller has already
+    /// wrapped. Used by the `LineFlow` paint path.
+    pub fn set_segments(&mut self, rect: Rect, y: u16, segments: &[(&str, SpanStyle)]) {
+        if rect.width == 0 || y >= rect.bottom() {
+            return;
+        }
+        let mut col = 0usize;
+        let width = rect.width as usize;
+        for (text, style) in segments {
+            for ch in text.chars() {
+                if ch == '\n' {
+                    continue;
+                }
+                let cw = ch.width().unwrap_or(0).max(1);
+                if col + cw > width {
+                    break;
+                }
+                self.place_char(rect.x, y, col, ch, cw, *style);
+                col += cw;
+            }
+            if col >= width {
+                break;
+            }
+        }
+    }
+
     /// Place a single character at `(x0 + col, y)`. Wide characters blank the
     /// following cell.
     fn place_char(&mut self, x0: u16, y: u16, col: usize, ch: char, cw: usize, style: SpanStyle) {
@@ -432,5 +459,31 @@ mod tests {
         assert!(s.contains("48;5;12m"), "should set blue bg: {s}");
         // crossed-out SGR is 9.
         assert!(s.contains("[9m"), "should set crossed-out: {s}");
+    }
+
+    #[test]
+    fn set_segments_writes_each_segment_with_its_style() {
+        let mut canvas = Canvas::empty(Rect::new(0, 0, 5, 1));
+        let segs: &[(&str, crate::text::SpanStyle)] = &[
+            ("ab", crate::text::SpanStyle::default()),
+            (
+                "cd",
+                crate::text::SpanStyle {
+                    fg: Some(Color::Red),
+                    ..crate::text::SpanStyle::default()
+                },
+            ),
+        ];
+        canvas.set_segments(Rect::new(0, 0, 5, 1), 0, segs);
+        assert_eq!(canvas.cell(0, 0).unwrap().character.as_ref().unwrap().value, "a");
+        assert_eq!(canvas.cell(2, 0).unwrap().character.as_ref().unwrap().value, "c");
+        assert_eq!(
+            canvas.cell(2, 0).unwrap().character.as_ref().unwrap().style.fg,
+            Some(Color::Red)
+        );
+        assert_eq!(
+            canvas.cell(0, 0).unwrap().character.as_ref().unwrap().style.fg,
+            None
+        );
     }
 }

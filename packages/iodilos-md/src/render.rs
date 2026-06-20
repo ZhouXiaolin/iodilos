@@ -6,9 +6,10 @@
 //! document becomes one `LineFlow`'s worth of `Line`s.
 
 use iodilos::text::{Line, Modifier, Span, SpanStyle};
+use unicode_width::UnicodeWidthStr;
 
 use crate::highlight::Highlighter;
-use crate::parser::{Block, Inline};
+use crate::parser::{Block, Inline, List, ListItem};
 use crate::theme::MarkdownTheme;
 use crate::wrap::wrap_inline_runs;
 
@@ -42,7 +43,6 @@ fn render_block(
     blockquote_depth: usize,
     out: &mut Vec<Line>,
 ) {
-    let _ = hl;
     match block {
         Block::Heading { level, inlines } => render_heading(*level, inlines, theme, out),
         Block::Rule => render_rule(theme, width, out),
@@ -52,8 +52,10 @@ fn render_block(
         Block::BlockQuote(blocks) => {
             render_blockquote(blocks, width, theme, hl, blockquote_depth, out)
         }
+        Block::List(list) => {
+            render_list(list, width, theme, hl, blockquote_depth, 0, out)
+        }
         Block::CodeBlock { .. }
-        | Block::List(_)
         | Block::Table(_)
         | Block::Math(_) => todo!("later tasks"),
     }
@@ -202,6 +204,80 @@ fn render_blockquote(
     }
 }
 
+fn render_list(
+    list: &List,
+    width: usize,
+    theme: &MarkdownTheme,
+    hl: &Highlighter,
+    blockquote_depth: usize,
+    indent: usize,
+    out: &mut Vec<Line>,
+) {
+    let indent_str = " ".repeat(indent);
+    for (idx, item) in list.items.iter().enumerate() {
+        let marker = item_marker(idx, item, list.ordered, theme);
+        // First-line prefix = indent (if any) + marker. Omit a zero-width indent
+        // span so the marker is genuinely the first span at the top level.
+        let mut first_prefix: Vec<Span> = Vec::new();
+        if indent > 0 {
+            first_prefix.push(Span::raw(indent_str.clone()));
+        }
+        first_prefix.push(marker.clone());
+        // Continuation indent = indent + marker visual width.
+        let marker_w = UnicodeWidthStr::width(marker.content.as_ref());
+        let cont_indent = " ".repeat(indent + marker_w);
+        let cont_prefix = vec![Span::raw(cont_indent)];
+
+        let runs = inline_runs(&item.inlines, theme, blockquote_depth);
+        let lines = wrap_inline_runs(runs, &first_prefix, &cont_prefix, width);
+        out.extend(lines);
+
+        // Nested children render indented further.
+        if !item.children.is_empty() {
+            let mut inner = Vec::new();
+            let mut first = true;
+            for child in &item.children {
+                if !first {
+                    inner.push(Line::raw(""));
+                }
+                first = false;
+                render_block(child, width.saturating_sub(2), theme, hl, blockquote_depth, &mut inner);
+            }
+            // Re-indent each nested line by `indent + 2`.
+            let nest_indent = format!("{}  ", indent_str);
+            for mut line in inner {
+                let mut spans = vec![Span::raw(nest_indent.clone())];
+                spans.append(&mut line.spans);
+                out.push(Line::from(spans));
+            }
+        }
+    }
+}
+
+fn item_marker(idx: usize, item: &ListItem, ordered: bool, theme: &MarkdownTheme) -> Span {
+    let (text, color) = if let Some(checked) = item.checked {
+        (
+            if checked {
+                "[x] ".to_string()
+            } else {
+                "[ ] ".to_string()
+            },
+            theme.task_marker,
+        )
+    } else if ordered {
+        (format!("{}. ", idx + 1), theme.list_marker)
+    } else {
+        ("• ".to_string(), theme.list_marker)
+    };
+    Span::styled(
+        text,
+        SpanStyle {
+            fg: Some(color),
+            ..SpanStyle::default()
+        },
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -271,6 +347,34 @@ mod tests {
             "expected blockquote bar, got {:?}",
             first_span.content
         );
+    }
+
+    #[test]
+    fn unordered_list_draws_bullet_markers() {
+        let theme = MarkdownTheme::default();
+        let lines = render_to_lines("- one\n- two\n- three", 40, &theme);
+        let bullets = lines
+            .iter()
+            .filter(|l| {
+                l.spans
+                    .first()
+                    .is_some_and(|s| s.content.as_ref().starts_with("•"))
+            })
+            .count();
+        assert_eq!(bullets, 3, "three bullet markers: {lines:?}");
+    }
+
+    #[test]
+    fn task_list_draws_checkbox() {
+        let theme = MarkdownTheme::default();
+        let lines = render_to_lines("- [x] done\n- [ ] todo", 40, &theme);
+        let joined: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|s| s.content.as_ref().to_string())
+            .collect();
+        assert!(joined.contains("[x]"), "checked box: {joined}");
+        assert!(joined.contains("[ ]"), "unchecked box: {joined}");
     }
 
     #[test]

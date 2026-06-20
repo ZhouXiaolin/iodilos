@@ -45,6 +45,15 @@ impl<T> View<T> {
     }
 }
 
+impl View<TuiNode> {
+    /// Build a `LineFlow` view from multiple `Line`s with offset 0. Use this in
+    /// place of the removed `From<Vec<Line>>` (which collided with
+    /// `From<Vec<View>>`).
+    pub fn line_flow(lines: Vec<crate::text::Line>) -> Self {
+        View::from_node(TuiNode::create_line_flow_node(lines, 0))
+    }
+}
+
 impl<T> Default for View<T> {
     fn default() -> Self {
         Self::new()
@@ -196,4 +205,21 @@ pub trait ViewTuiNode: ViewNode {
     fn create_marker_node() -> Self;
     /// Build a `LineFlow` node from `lines` with the given initial `offset`.
     fn create_line_flow_node(lines: Vec<crate::text::Line>, offset: i32) -> Self;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::text::{Line, Span};
+
+    #[test]
+    fn line_flow_builds_multiline_view() {
+        let view = View::line_flow(vec![Line::raw("first"), Line::from(Span::raw("second"))]);
+        let node = &view.nodes()[0];
+        let n_lines = match node {
+            TuiNode::LineFlow { lines, .. } => lines.borrow().len(),
+            _ => panic!("expected LineFlow, got {node:?}"),
+        };
+        assert_eq!(n_lines, 2);
+    }
 }

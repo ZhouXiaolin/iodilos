@@ -106,6 +106,51 @@ pub enum Alignment {
     Right,
 }
 
+/// A styled run of text: the smallest styleable unit. Mirrors
+/// `ratatui_core::text::Span` but `'static` (a `TuiNode` outlives any borrow).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Span {
+    /// The style of this span.
+    pub style: SpanStyle,
+    /// The content as a clone-on-write static string.
+    pub content: Cow<'static, str>,
+}
+
+impl Span {
+    /// A span with the default (unset) style.
+    pub fn raw<T: Into<Cow<'static, str>>>(content: T) -> Self {
+        Self {
+            style: SpanStyle::default(),
+            content: content.into(),
+        }
+    }
+
+    /// A span with the given style.
+    pub fn styled<T: Into<Cow<'static, str>>>(content: T, style: SpanStyle) -> Self {
+        Self {
+            style,
+            content: content.into(),
+        }
+    }
+
+    /// Unicode display width of this span's content.
+    pub fn width(&self) -> usize {
+        unicode_width::UnicodeWidthStr::width(self.content.as_ref())
+    }
+}
+
+impl From<&'static str> for Span {
+    fn from(s: &'static str) -> Self {
+        Span::raw(s)
+    }
+}
+
+impl From<String> for Span {
+    fn from(s: String) -> Self {
+        Span::raw(s)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -166,5 +211,19 @@ mod tests {
     #[test]
     fn alignment_default_is_left() {
         assert_eq!(Alignment::default(), Alignment::Left);
+    }
+
+    #[test]
+    fn span_raw_has_no_style() {
+        let s = Span::raw("hi");
+        assert_eq!(s.content, Cow::Borrowed("hi"));
+        assert_eq!(s.style, SpanStyle::default());
+    }
+
+    #[test]
+    fn span_width_counts_unicode() {
+        assert_eq!(Span::raw("abc").width(), 3);
+        // CJK fullwidth chars are width 2 each.
+        assert_eq!(Span::raw("你好").width(), 4);
     }
 }

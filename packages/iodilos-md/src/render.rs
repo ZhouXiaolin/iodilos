@@ -55,8 +55,10 @@ fn render_block(
         Block::List(list) => {
             render_list(list, width, theme, hl, blockquote_depth, 0, out)
         }
-        Block::CodeBlock { .. }
-        | Block::Table(_)
+        Block::CodeBlock { lang, code } => {
+            render_code_block(lang, code, width, theme, hl, out)
+        }
+        Block::Table(_)
         | Block::Math(_) => todo!("later tasks"),
     }
 }
@@ -278,6 +280,70 @@ fn item_marker(idx: usize, item: &ListItem, ordered: bool, theme: &MarkdownTheme
     )
 }
 
+fn render_code_block(
+    lang: &Option<String>,
+    code: &str,
+    width: usize,
+    theme: &MarkdownTheme,
+    hl: &Highlighter,
+    out: &mut Vec<Line>,
+) {
+    let lang_str = lang.as_deref().unwrap_or("");
+    let inner_w = width.saturating_sub(4).max(2); // "│ " + content + " │"
+    let border = Span::styled(
+        "│",
+        SpanStyle {
+            fg: Some(theme.code_border),
+            ..SpanStyle::default()
+        },
+    );
+    let top_bar = Span::styled(
+        "─".repeat(width.max(1)),
+        SpanStyle {
+            fg: Some(theme.code_border),
+            ..SpanStyle::default()
+        },
+    );
+
+    out.push(Line::from(vec![top_bar]));
+    for line in code.lines() {
+        let tokens = hl.highlight_line(line, lang_str);
+        let mut spans: Vec<Span> = vec![border.clone(), Span::raw(" ")];
+        if tokens.is_empty() {
+            spans.push(Span::raw(" "));
+        } else {
+            for (text, color) in tokens {
+                let style = match color {
+                    Some(c) => SpanStyle {
+                        fg: Some(c),
+                        ..SpanStyle::default()
+                    },
+                    None => SpanStyle::default(),
+                };
+                spans.push(Span::styled(text, style));
+            }
+        }
+        // Pad to inner_w + trailing " │"
+        let used: usize = spans
+            .iter()
+            .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+            .sum();
+        let pad = inner_w.saturating_sub(used).max(1);
+        spans.push(Span::raw(" ".repeat(pad)));
+        spans.push(Span::raw(" "));
+        spans.push(border.clone());
+        out.push(Line::from(spans));
+    }
+    let bottom_bar = Span::styled(
+        "─".repeat(width.max(1)),
+        SpanStyle {
+            fg: Some(theme.code_border),
+            ..SpanStyle::default()
+        },
+    );
+    out.push(Line::from(vec![bottom_bar]));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -375,6 +441,28 @@ mod tests {
             .collect();
         assert!(joined.contains("[x]"), "checked box: {joined}");
         assert!(joined.contains("[ ]"), "unchecked box: {joined}");
+    }
+
+    #[test]
+    fn code_block_emits_highlighted_spans_with_frame() {
+        let theme = MarkdownTheme::default();
+        let src = "```rust\nfn main() {}\n```\n";
+        let lines = render_to_lines(src, 40, &theme);
+        let joined: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|s| s.content.as_ref().to_string())
+            .collect();
+        assert!(joined.contains('│'), "frame side bars: {joined}");
+        assert!(joined.contains("fn main()"), "code text present: {joined}");
+        // At least one span is colored (rust highlighting).
+        assert!(
+            lines
+                .iter()
+                .flat_map(|l| l.spans.iter())
+                .any(|s| s.style.fg.is_some()),
+            "some highlighted span"
+        );
     }
 
     #[test]

@@ -193,9 +193,6 @@ pub trait ViewNode: Into<View<Self>> + Sized + 'static {
 pub trait ViewTuiNode: ViewNode {
     fn create_element(tag: Cow<'static, str>) -> Self;
     fn create_text_node(text: Cow<'static, str>) -> Self;
-    fn create_dynamic_text_node(text: Cow<'static, str>) -> Self {
-        Self::create_text_node(text)
-    }
     fn create_marker_node() -> Self;
     /// Build a `LineFlow` node from `lines` with the given initial `offset`.
     fn create_line_flow_node(lines: Vec<crate::text::Line>, offset: i32) -> Self;

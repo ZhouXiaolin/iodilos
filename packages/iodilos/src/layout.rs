@@ -272,27 +272,6 @@ fn build_node(
                 line_flow: Some((lines_snapshot, offset_value)),
             })
         }
-        TuiNode::TextDynamic { id, text } => {
-            let text = text.borrow().clone();
-            let taffy_id = tree
-                .new_leaf_with_context(
-                    taffy::style::Style::default(),
-                    Measure::Text { text: text.clone() },
-                )
-                .expect("create dynamic text node");
-            Some(BuiltNode {
-                runtime_id: *id,
-                taffy_id,
-                parent,
-                tag: None,
-                text,
-                style: Style::default(),
-                focusable: false,
-                text_leaf: false,
-                children: Vec::new(),
-                line_flow: None,
-            })
-        }
         TuiNode::Dynamic { id, view } => {
             let children = view
                 .borrow()
@@ -824,12 +803,7 @@ fn is_text_leaf(tag: &str, children: &[TuiNode]) -> bool {
     matches!(tag, "span" | "p" | "input")
         || (tag == "button"
             && children.iter().all(|child| {
-                matches!(
-                    child,
-                    TuiNode::TextDynamic { .. }
-                        | TuiNode::LineFlow { .. }
-                        | TuiNode::Marker { .. }
-                )
+                matches!(child, TuiNode::LineFlow { .. } | TuiNode::Marker { .. })
             }))
 }
 

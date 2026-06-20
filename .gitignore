@@ -1,0 +1,9 @@
+/target
+
+# IDE
+.vscode/
+.idea/
+*.iml
+
+# Trunk output
+/**/dist

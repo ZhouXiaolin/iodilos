@@ -1,0 +1,18 @@
+[package]
+name = "iodilos-macros"
+categories = ["command-line-interface", "gui"]
+description = "Proc-macro crate for iodilos (view! macro + inlined view parser)"
+keywords = ["tui", "terminal", "reactive", "view"]
+edition = "2024"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/solaren/iodilos"
+version = "0.1.0"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = "1.0.47"
+quote = "1.0.21"
+syn = { version = "2.0.10", features = ["extra-traits", "full"] }

@@ -100,7 +100,10 @@ macro_rules! impl_view_from {
         $(
             impl<T: ViewTuiNode> From<$ty> for View<T> {
                 fn from(t: $ty) -> Self {
-                    View::from_node(T::create_text_node(t.into()))
+                    View::from_node(T::create_line_flow_node(
+                        vec![crate::text::Line::raw(t)],
+                        0,
+                    ))
                 }
             }
         )*
@@ -112,7 +115,10 @@ macro_rules! impl_view_from_to_string {
         $(
             impl<T: ViewTuiNode> From<$ty> for View<T> {
                 fn from(t: $ty) -> Self {
-                    View::from_node(T::create_text_node(t.to_string().into()))
+                    View::from_node(T::create_line_flow_node(
+                        vec![crate::text::Line::raw(t.to_string())],
+                        0,
+                    ))
                 }
             }
         )*

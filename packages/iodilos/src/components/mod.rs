@@ -106,9 +106,15 @@ mod tests {
         assert_eq!(node.attribute_value("id").as_deref(), Some("save"));
         assert_eq!(element.children.len(), 1);
 
-        let TuiNode::TextStatic { text, .. } = &element.children[0] else {
-            panic!("text child should be retained as a text node");
+        let TuiNode::LineFlow { lines, .. } = &element.children[0] else {
+            panic!("text child should now be a LineFlow node");
         };
-        assert_eq!(text.as_ref(), "Save");
+        let lines = lines.borrow();
+        assert_eq!(lines.len(), 1, "one Line for \"Save\"");
+        let mut s = String::new();
+        for span in &lines[0].spans {
+            s.push_str(span.content.as_ref());
+        }
+        assert_eq!(s, "Save");
     }
 }

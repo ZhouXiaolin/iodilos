@@ -15,7 +15,7 @@ use unicode_width::UnicodeWidthStr;
 use crate::attributes::resolve_style;
 use crate::canvas::{Canvas, Rect};
 use crate::node::{NodeId, TuiNode};
-use crate::style::{Edges, Style, TextStyle};
+use crate::style::{Edges, Style};
 use crate::text::SpanStyle;
 
 #[derive(Debug, Clone)]
@@ -235,7 +235,7 @@ pub(crate) fn render(
 
     let mut canvas = Canvas::empty(area);
     // Text paint inherits from the root; layout/border/background do not.
-    let root_text = TextStyle::default();
+    let root_text = SpanStyle::default();
     for node in &paint_nodes {
         paint_node(&mut canvas, node, root_text, area_paint, area_paint);
     }
@@ -407,7 +407,7 @@ fn extract_node(
 fn paint_node(
     canvas: &mut Canvas,
     node: &PaintNode,
-    parent_text: TextStyle,
+    parent_text: SpanStyle,
     clip: PaintRect,
     screen: PaintRect,
 ) {
@@ -415,7 +415,7 @@ fn paint_node(
 
     // Resolve the inheritable text style: this node's text-paint fields inherit
     // from the parent's.
-    let text = node.style.text_style().inherit(parent_text);
+    let text = parent_text.patch(node.style.text_span_style());
     if has_size {
         if let Some(bg) = node.style.background_color
             && let Some(rect) = intersect_rect(node.rect, clip)
@@ -450,12 +450,11 @@ fn paint_node(
         // Only leaf/inline tags emit text; containers delegate to their children.
         if node.text_leaf {
             let display_text = display_text_for_tag(node.tag.as_deref(), &node.text);
-            let span_style = SpanStyle::from(text);
-            paint_text_clipped(canvas, node.rect, &display_text, span_style, clip);
+            paint_text_clipped(canvas, node.rect, &display_text, text, clip);
         }
 
         if let Some((lines, offset)) = &node.line_flow {
-            let base = SpanStyle::from(text);
+            let base = text;
             let width = node.rect.width as usize;
             let rows = wrap_lines(lines, width, base);
             let offset = (*offset).max(0) as usize;
@@ -1263,6 +1262,25 @@ mod tests {
         assert!(!plain_cell.style.add_modifier.contains(crate::text::Modifier::BOLD));
         assert!(bold_cell.style.add_modifier.contains(crate::text::Modifier::BOLD));
         assert_eq!(red_cell.style.fg, Some(crate::Color::Red));
+        root.dispose();
+    }
+
+    #[test]
+    fn dim_and_crossed_out_builders_set_style_fields() {
+        let mut nodes = Vec::new();
+        let root = crate::reactive::create_root(|| {
+            let view: View = tags::div()
+                .dim(true)
+                .crossed_out(true)
+                .underline_color(crate::Color::Cyan)
+                .children("x")
+                .into();
+            nodes = view.nodes.into_iter().collect();
+        });
+        let (canvas, _index) = render(&nodes, Rect::new(0, 0, 1, 1), None);
+        let cell = canvas.cell(0, 0).unwrap().character.as_ref().unwrap();
+        assert!(cell.style.add_modifier.contains(crate::text::Modifier::DIM));
+        assert!(cell.style.add_modifier.contains(crate::text::Modifier::CROSSED_OUT));
         root.dispose();
     }
 

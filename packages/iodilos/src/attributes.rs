@@ -414,6 +414,8 @@ pub trait GlobalAttributesExt: GlobalAttributes {
         (underline, bool, underline);
         (italic, bool, italic);
         (invert, bool, invert);
+        (dim, bool, dim);
+        (crossed_out, bool, crossed_out);
     }
 
     style_methods_optional! {
@@ -425,6 +427,7 @@ pub trait GlobalAttributesExt: GlobalAttributes {
         (background_color, crossterm::style::Color, background_color);
         (border_color, crossterm::style::Color, border_color);
         (color, crossterm::style::Color, color);
+        (underline_color, crossterm::style::Color, underline_color);
     }
 }
 /// A spreadable attribute bag.

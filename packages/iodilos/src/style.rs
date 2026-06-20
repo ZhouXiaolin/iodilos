@@ -8,6 +8,7 @@
 
 use bitflags::bitflags;
 use crossterm::style::Color;
+use crate::text::{Modifier, SpanStyle};
 // `MaybeDyn` must be in scope: `impl_into_maybe_dyn!` references the unqualified
 // type name in its expansion. Both are re-exported at the crate root (the macro
 // via `#[macro_export]`, the type via `pub use reactive::*`).
@@ -517,6 +518,12 @@ pub struct Style {
     pub italic: bool,
     /// `invert`.
     pub invert: bool,
+    /// `dim` (faint text).
+    pub dim: bool,
+    /// `crossed_out` (strikethrough).
+    pub crossed_out: bool,
+    /// `underline_color`.
+    pub underline_color: Option<Color>,
 }
 
 impl Style {
@@ -607,14 +614,37 @@ impl Style {
         }
     }
 
-    /// The inheritable text-style portion of this style.
-    pub(crate) fn text_style(&self) -> TextStyle {
-        TextStyle {
-            color: self.color,
-            weight: self.weight,
-            underline: self.underline,
-            italic: self.italic,
-            invert: self.invert,
+    /// The inheritable text-style portion of this style, as a `SpanStyle` (the
+    /// single text-style type). Used by layout paint as the base onto which
+    /// each `Span`'s style patches.
+    pub(crate) fn text_span_style(&self) -> SpanStyle {
+        let mut add = Modifier::empty();
+        match self.weight {
+            Weight::Bold => add |= Modifier::BOLD,
+            Weight::Light => add |= Modifier::DIM,
+            Weight::Normal => {}
+        }
+        if self.underline {
+            add |= Modifier::UNDERLINED;
+        }
+        if self.italic {
+            add |= Modifier::ITALIC;
+        }
+        if self.invert {
+            add |= Modifier::REVERSED;
+        }
+        if self.dim {
+            add |= Modifier::DIM;
+        }
+        if self.crossed_out {
+            add |= Modifier::CROSSED_OUT;
+        }
+        SpanStyle {
+            fg: self.color,
+            bg: None,
+            underline_color: self.underline_color,
+            add_modifier: add,
+            sub_modifier: Modifier::empty(),
         }
     }
 }
@@ -638,6 +668,26 @@ impl_into_maybe_dyn!(Weight);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn text_span_style_assembles_modifiers_and_underline_color() {
+        let style = Style {
+            color: Some(Color::Yellow),
+            weight: Weight::Bold,
+            italic: true,
+            dim: true,
+            crossed_out: true,
+            underline_color: Some(Color::Cyan),
+            ..Style::default()
+        };
+        let s = style.text_span_style();
+        assert_eq!(s.fg, Some(Color::Yellow));
+        assert!(s.add_modifier.contains(crate::text::Modifier::BOLD));
+        assert!(s.add_modifier.contains(crate::text::Modifier::ITALIC));
+        assert!(s.add_modifier.contains(crate::text::Modifier::DIM));
+        assert!(s.add_modifier.contains(crate::text::Modifier::CROSSED_OUT));
+        assert_eq!(s.underline_color, Some(Color::Cyan));
+    }
 
     #[test]
     fn length_types_convert_from_int_and_percent() {
@@ -682,9 +732,9 @@ mod tests {
         assert_eq!(taffy.padding.top, LengthPercentage::length(2.0));
         assert_eq!(taffy.padding.left, LengthPercentage::length(1.0));
 
-        let text = style.text_style();
-        assert_eq!(text.color, Some(Color::Yellow));
-        assert_eq!(text.weight, Weight::Bold);
+        let text = style.text_span_style();
+        assert_eq!(text.fg, Some(Color::Yellow));
+        assert!(text.add_modifier.contains(crate::text::Modifier::BOLD));
         assert_eq!(style.background_color, Some(Color::Blue));
     }
 

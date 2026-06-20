@@ -10,6 +10,7 @@ use iodilos::text::{Line, Modifier, Span, SpanStyle};
 use crate::highlight::Highlighter;
 use crate::parser::{Block, Inline};
 use crate::theme::MarkdownTheme;
+use crate::wrap::wrap_inline_runs;
 
 /// Render a full markdown source into a flat line list at `width` (cells).
 pub fn render_to_lines(src: &str, width: usize, theme: &MarkdownTheme) -> Vec<Line> {
@@ -41,12 +42,14 @@ fn render_block(
     blockquote_depth: usize,
     out: &mut Vec<Line>,
 ) {
-    let _ = (hl, blockquote_depth);
+    let _ = hl;
     match block {
         Block::Heading { level, inlines } => render_heading(*level, inlines, theme, out),
         Block::Rule => render_rule(theme, width, out),
-        Block::Paragraph(_)
-        | Block::CodeBlock { .. }
+        Block::Paragraph(inlines) => {
+            render_paragraph(inlines, width, theme, blockquote_depth, out)
+        }
+        Block::CodeBlock { .. }
         | Block::List(_)
         | Block::BlockQuote(_)
         | Block::Table(_)
@@ -111,6 +114,58 @@ fn render_rule(theme: &MarkdownTheme, width: usize, out: &mut Vec<Line>) {
     )]));
 }
 
+fn render_paragraph(
+    inlines: &[Inline],
+    width: usize,
+    theme: &MarkdownTheme,
+    blockquote_depth: usize,
+    out: &mut Vec<Line>,
+) {
+    let runs = inline_runs(inlines, theme, blockquote_depth);
+    let lines = wrap_inline_runs(runs, &[], &[], width);
+    out.extend(lines);
+}
+
+/// Convert parsed `Inline`s into styled `Span`s (one span per run; inline code
+/// and math get their own themed style).
+fn inline_runs(inlines: &[Inline], theme: &MarkdownTheme, blockquote_depth: usize) -> Vec<Span> {
+    let _ = blockquote_depth; // already baked into Text style by the parser
+    let mut spans = Vec::new();
+    for inline in inlines {
+        match inline {
+            Inline::Text(t, st) => {
+                if t.is_empty() {
+                    continue;
+                }
+                spans.push(Span::styled(t.clone(), *st));
+            }
+            Inline::Code(t) => {
+                spans.push(Span::styled(
+                    format!(" {t} "),
+                    SpanStyle {
+                        fg: Some(theme.code_text),
+                        bg: Some(theme.code_bg),
+                        ..SpanStyle::default()
+                    },
+                ));
+            }
+            Inline::Math(t) => {
+                spans.push(Span::styled(
+                    format!(" ${t}$ "),
+                    SpanStyle {
+                        fg: Some(theme.math_text),
+                        ..SpanStyle::default()
+                    },
+                ));
+            }
+            Inline::SoftBreak => {
+                spans.push(Span::raw(" "));
+            }
+        }
+    }
+    spans
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -137,6 +192,35 @@ mod tests {
             .map(|s| s.content.as_ref())
             .collect();
         assert_eq!(s, "──────────");
+    }
+
+    #[test]
+    fn paragraph_renders_inline_runs_as_spans() {
+        let theme = MarkdownTheme::default();
+        let lines = render_to_lines("hello world", 40, &theme);
+        // one paragraph line; its spans carry the body color.
+        let para = &lines[0];
+        let text: String = para.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("hello"), "text present: {text}");
+        assert!(text.contains("world"), "text present: {text}");
+        assert!(
+            para.spans.iter().all(|s| s.style.fg == Some(theme.text)),
+            "body color on every span: {para:?}"
+        );
+    }
+
+    #[test]
+    fn paragraph_bold_run_keeps_strong_color() {
+        let theme = MarkdownTheme::default();
+        let lines = render_to_lines("**bold**", 40, &theme);
+        let para = &lines[0];
+        let bold_span = para
+            .spans
+            .iter()
+            .find(|s| s.content.as_ref() == "bold")
+            .expect("bold span");
+        assert_eq!(bold_span.style.fg, Some(theme.strong_text));
+        assert!(bold_span.style.add_modifier.contains(Modifier::BOLD));
     }
 
     #[test]

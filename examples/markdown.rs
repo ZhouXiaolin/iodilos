@@ -15,7 +15,7 @@ use crossterm::event::{KeyCode, KeyEventKind, MouseEventKind};
 use crossterm::terminal::size as term_size;
 use iodilos::node::TuiNode;
 use iodilos::prelude::*;
-use iodilos_md::{markdown_lines, MarkdownTheme};
+use iodilos_md::{MarkdownTheme, StreamingParser};
 use tokio::time::sleep;
 
 const SAMPLE_MD: &str = "\
@@ -101,10 +101,12 @@ fn app() -> View {
     let visible_rows =
         create_memo(move || (term_rows.get() as i32).saturating_sub(CHROME_ROWS).max(1));
 
-    // Reactive line list: rebuild on content or width change.
+    // Incremental parser held outside the memo so its committed-prefix cache
+    // survives every rebuild; each tick re-parses only the open tail.
+    let parser = std::rc::Rc::new(std::cell::RefCell::new(StreamingParser::new()));
     let lines = create_memo(move || {
         let width = (term_cols.get() as i32).saturating_sub(4).max(1) as usize;
-        markdown_lines(&content.get_clone(), width, &theme)
+        parser.borrow_mut().feed_to_lines(&content.get_clone(), width, &theme)
     });
     let total_lines = create_memo(move || lines.get_clone().len() as i32);
     let max_offset =

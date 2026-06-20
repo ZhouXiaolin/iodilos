@@ -1,0 +1,578 @@
+//! Block-level Markdown intermediate representation.
+//!
+//! [`parse`] runs `pulldown-cmark` over the source and folds the event stream
+//! into a flat `Vec<Block>` tree. Keeping an IR (rather than rendering straight
+//! from cmark events) decouples the parser from the iodilos renderer and lets
+//! each block be rendered independently.
+//!
+//! Inline styling (bold/italic/strike/links) is **collapsed into plain text**:
+//! under route A (no iodilos core changes) a single text leaf carries one
+//! style, so we keep inline markers' text but drop their per-run styling. Inline
+//! `code` and `math` are kept as distinct leaves ([`Inline::Code`] /
+//! [`Inline::Math`]) so the renderer can color them.
+
+use iodilos::text::SpanStyle;
+use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+
+/// A single block-level Markdown element.
+#[derive(Clone, Debug)]
+pub enum Block {
+    /// An `#`-prefixed heading. `level` is 1..=6.
+    Heading { level: u8, inlines: Vec<Inline> },
+    /// A paragraph of inline content.
+    Paragraph(Vec<Inline>),
+    /// A fenced or indented code block.
+    CodeBlock { lang: Option<String>, code: String },
+    /// A list (ordered or unordered), possibly nested.
+    List(List),
+    /// A blockquote, containing further blocks.
+    BlockQuote(Vec<Block>),
+    /// A thematic break (`---`).
+    Rule,
+    /// A GFM table.
+    Table(Table),
+    /// A block-level display math block (`$$...$$`). The raw LaTeX source is
+    /// stored verbatim — terminal rendering cannot do real math typesetting, so
+    /// it is shown as a monospace centered block (see the renderer).
+    Math(String),
+}
+
+/// A list, ordered (`1.`) or unordered (`-`/`*`).
+#[derive(Clone, Debug)]
+pub struct List {
+    pub ordered: bool,
+    pub items: Vec<ListItem>,
+}
+
+/// One list item.
+#[derive(Clone, Debug)]
+pub struct ListItem {
+    /// For task-list items, the checkbox state.
+    pub checked: Option<bool>,
+    /// The item's inline content (its own text).
+    pub inlines: Vec<Inline>,
+    /// Child blocks nested under this item (sub-lists, etc.).
+    pub children: Vec<Block>,
+}
+
+/// A GFM table.
+#[derive(Clone, Debug)]
+pub struct Table {
+    pub headers: Vec<String>,
+    pub aligns: Vec<Alignment>,
+    pub rows: Vec<Vec<String>>,
+}
+
+/// Inline content. Each `Text` run carries the `SpanStyle` resolved from the
+/// inline state (bold/italic/strike/link) at parse time, so the renderer can
+/// emit one styled `Span` per run without re-deriving state.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Inline {
+    /// A styled text run (bold/italic/strike/link resolved to `SpanStyle`).
+    Text(String, SpanStyle),
+    /// Inline `code` — renderer wraps it with the code style.
+    Code(String),
+    /// Inline math (`$...$`) or display math (`$$...$$`) mixed into a paragraph.
+    /// Raw LaTeX source, rendered monospace like code.
+    Math(String),
+    /// A soft/hard line break inside a paragraph.
+    SoftBreak,
+}
+
+/// Parse Markdown source into a list of blocks.
+pub fn parse(src: &str) -> Vec<Block> {
+    let mut opts = Options::empty();
+    opts.insert(Options::ENABLE_TABLES);
+    opts.insert(Options::ENABLE_STRIKETHROUGH);
+    opts.insert(Options::ENABLE_TASKLISTS);
+    opts.insert(Options::ENABLE_MATH);
+    let parser = Parser::new_ext(src, opts);
+
+    let mut p = ParseState::default();
+    for ev in parser {
+        p.event(ev);
+    }
+    p.finish()
+}
+
+/// Build a paragraph block from accumulated inlines, promoting a lone math run
+/// to a standalone [`Block::Math`] (the common `$$...$$` case, which cmark
+/// emits as a single-inline paragraph). Math mixed with surrounding text stays
+/// inline.
+fn paragraph_block(inlines: Vec<Inline>) -> Block {
+    if inlines.len() == 1 && matches!(inlines[0], Inline::Math(_)) {
+        let Inline::Math(src) = inlines.into_iter().next().unwrap() else {
+            unreachable!()
+        };
+        Block::Math(src)
+    } else {
+        Block::Paragraph(inlines)
+    }
+}
+
+/// The mutable accumulator for a single `parse` pass.
+#[derive(Default)]
+struct ParseState {
+    /// Top-level finished blocks.
+    top: Vec<Block>,
+    /// Open containers (lists, blockquotes, tables).
+    stack: Vec<Frame>,
+    /// Inline accumulator for the in-progress paragraph / heading / item.
+    inlines: Vec<Inline>,
+    /// Heading level while inside a `<hN>`, else `None`.
+    in_heading: Option<u8>,
+    /// `Some` while inside a code block; the body is appended here.
+    code_buf: Option<String>,
+    code_lang: Option<String>,
+    /// `Some` while inside a table cell; text is appended here.
+    cell_buf: Option<String>,
+}
+
+impl ParseState {
+    fn event(&mut self, ev: Event) {
+        // While inside a code block, only End(CodeBlock) matters; everything
+        // else is body text (cmark emits Text events for the code contents).
+        if let Some(buf) = self.code_buf.as_mut() {
+            match ev {
+                Event::Text(t) => buf.push_str(t.as_ref()),
+                Event::End(TagEnd::CodeBlock) => {
+                    let code = self.code_buf.take().unwrap_or_default();
+                    let lang = self.code_lang.take();
+                    self.push_block(Block::CodeBlock { lang, code });
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        // Inside a table cell, route text to the cell buffer.
+        if self.cell_buf.is_some()
+            && matches!(
+                self.stack.last(),
+                Some(Frame::Table(_))
+            )
+        {
+            match ev {
+                Event::Text(t) => {
+                    if let Some(buf) = self.cell_buf.as_mut() {
+                        buf.push_str(t.as_ref());
+                    }
+                }
+                Event::End(TagEnd::TableCell) => {
+                    let cell = self.cell_buf.take().unwrap_or_default();
+                    if let Some(Frame::Table(tf)) = self.stack.last_mut() {
+                        if tf.in_header {
+                            tf.table.headers.push(cell);
+                        } else {
+                            tf.row.push(cell);
+                        }
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        match ev {
+            Event::Start(Tag::Paragraph) => {}
+            Event::End(TagEnd::Paragraph) => {
+                let inlines = std::mem::take(&mut self.inlines);
+                self.push_block(paragraph_block(inlines));
+            }
+            Event::Start(Tag::Heading { level, .. }) => {
+                self.in_heading = Some(heading_level(level));
+            }
+            Event::End(TagEnd::Heading(_)) => {
+                let level = self.in_heading.take().unwrap_or(1);
+                let block = Block::Heading {
+                    level,
+                    inlines: std::mem::take(&mut self.inlines),
+                };
+                self.push_block(block);
+            }
+            Event::Start(Tag::CodeBlock(kind)) => {
+                self.code_buf = Some(String::new());
+                self.code_lang = match kind {
+                    CodeBlockKind::Fenced(lang) => {
+                        let lang = lang.into_string();
+                        if lang.is_empty() {
+                            None
+                        } else {
+                            Some(lang)
+                        }
+                    }
+                    CodeBlockKind::Indented => None,
+                };
+            }
+            // CodeBlock End is handled by the code_buf branch above.
+            Event::End(TagEnd::CodeBlock) => {}
+
+            Event::Start(Tag::List(start)) => {
+                // A nested list begins: flush any in-progress inlines into the
+                // currently-open item (its parent's own text) before opening the
+                // new list, so the parent's text is not attributed to a child.
+                self.flush_inlines_to_open_item();
+                let ordered = start.is_some();
+                self.stack.push(Frame::List(ListFrame {
+                    list: List {
+                        ordered,
+                        items: Vec::new(),
+                    },
+                    item: None,
+                }));
+            }
+            Event::End(TagEnd::List(_)) => {
+                if let Some(Frame::List(lf)) = self.stack.pop() {
+                    self.push_block(Block::List(lf.list));
+                }
+            }
+            Event::Start(Tag::Item) => {
+                // A new item starts: any pending inlines belong to the previous
+                // item, so flush them first.
+                self.flush_inlines_to_open_item();
+                if let Some(Frame::List(lf)) = self.stack.last_mut() {
+                    lf.item = Some(ListItem {
+                        checked: None,
+                        inlines: Vec::new(),
+                        children: Vec::new(),
+                    });
+                }
+            }
+            Event::End(TagEnd::Item) => {
+                let pending = std::mem::take(&mut self.inlines);
+                if let Some(Frame::List(lf)) = self.stack.last_mut()
+                    && let Some(item) = lf.item.as_mut()
+                {
+                    if !pending.is_empty() {
+                        item.inlines.extend(pending);
+                    }
+                    let finished = lf.item.take().expect("item open");
+                    lf.list.items.push(finished);
+                }
+            }
+            Event::TaskListMarker(checked) => {
+                if let Some(Frame::List(lf)) = self.stack.last_mut()
+                    && let Some(item) = lf.item.as_mut()
+                {
+                    item.checked = Some(checked);
+                }
+            }
+            Event::Start(Tag::BlockQuote(_)) => {
+                self.stack.push(Frame::Quote(Vec::new()));
+            }
+            Event::End(TagEnd::BlockQuote(_)) => {
+                if let Some(Frame::Quote(blocks)) = self.stack.pop() {
+                    self.push_block(Block::BlockQuote(blocks));
+                }
+            }
+
+            Event::Start(Tag::Table(aligns)) => {
+                self.stack.push(Frame::Table(TableFrame {
+                    table: Table {
+                        headers: Vec::new(),
+                        aligns: aligns.into_iter().collect(),
+                        rows: Vec::new(),
+                    },
+                    row: Vec::new(),
+                    in_header: true,
+                }));
+            }
+            Event::Start(Tag::TableHead) => {
+                if let Some(Frame::Table(tf)) = self.stack.last_mut() {
+                    tf.in_header = true;
+                }
+            }
+            Event::End(TagEnd::TableHead) => {
+                if let Some(Frame::Table(tf)) = self.stack.last_mut() {
+                    tf.in_header = false;
+                }
+            }
+            Event::Start(Tag::TableRow) => {
+                if let Some(Frame::Table(tf)) = self.stack.last_mut() {
+                    tf.row = Vec::new();
+                }
+            }
+            Event::End(TagEnd::TableRow) => {
+                if let Some(Frame::Table(tf)) = self.stack.last_mut() {
+                    let row = std::mem::take(&mut tf.row);
+                    tf.table.rows.push(row);
+                }
+            }
+            Event::Start(Tag::TableCell) => {
+                if matches!(self.stack.last(), Some(Frame::Table(_))) {
+                    self.cell_buf = Some(String::new());
+                }
+            }
+            // TableCell End is handled by the cell_buf branch above.
+            Event::End(TagEnd::TableCell) => {}
+            Event::End(TagEnd::Table) => {
+                if let Some(Frame::Table(tf)) = self.stack.pop() {
+                    self.push_block(Block::Table(tf.table));
+                }
+            }
+
+            Event::Rule => self.push_block(Block::Rule),
+
+            // Inline accumulation.
+            Event::Text(t) => push_inline(
+                &mut self.inlines,
+                Inline::Text(t.into_string(), SpanStyle::default()),
+            ),
+            Event::Code(t) => push_inline(&mut self.inlines, Inline::Code(t.into_string())),
+            // Both inline (`$...$`) and display (`$$...$$`) math arrive as
+            // inline runs carrying the raw LaTeX source. A display math run
+            // that ends up alone in its paragraph is promoted to a block above.
+            // Math never merges with a trailing Text run — keep it a distinct
+            // leaf so the renderer can color it.
+            Event::InlineMath(t) | Event::DisplayMath(t) => {
+                self.inlines.push(Inline::Math(t.into_string()));
+            }
+            Event::SoftBreak | Event::HardBreak => self.inlines.push(Inline::SoftBreak),
+            Event::FootnoteReference(t) => push_inline(
+                &mut self.inlines,
+                Inline::Text(t.into_string(), SpanStyle::default()),
+            ),
+            _ => {}
+        }
+    }
+
+    fn finish(mut self) -> Vec<Block> {
+        if !self.inlines.is_empty() {
+            self.top.push(paragraph_block(std::mem::take(
+                &mut self.inlines,
+            )));
+        }
+        self.top
+    }
+
+    /// Push a finished block into the innermost open container, or the top level.
+    fn push_block(&mut self, block: Block) {
+        match self.stack.last_mut() {
+            Some(Frame::Quote(blocks)) => blocks.push(block),
+            Some(Frame::List(lf)) => {
+                if let Some(item) = lf.item.as_mut() {
+                    item.children.push(block);
+                } else if let Some(last) = lf.list.items.last_mut() {
+                    last.children.push(block);
+                }
+            }
+            Some(Frame::Table(_)) => {
+                // A block inside a table is unexpected; drop defensively.
+            }
+            None => self.top.push(block),
+        }
+    }
+
+    /// Flush the in-progress `inlines` into the currently-open list item (if
+    /// any). Called when a new list or item starts, so that the previous item's
+    /// trailing text is attributed to it rather than leaking into the next.
+    fn flush_inlines_to_open_item(&mut self) {
+        let pending = std::mem::take(&mut self.inlines);
+        if pending.is_empty() {
+            return;
+        }
+        if let Some(Frame::List(lf)) = self.stack.last_mut()
+            && let Some(item) = lf.item.as_mut()
+        {
+            item.inlines.extend(pending);
+            return;
+        }
+        // No open item: restore so a later flush (e.g. paragraph end) still gets them.
+        self.inlines = pending;
+    }
+}
+
+/// Push an inline, merging with a trailing `Text` of equal style when possible.
+fn push_inline(inlines: &mut Vec<Inline>, inline: Inline) {
+    if let (Some(Inline::Text(prev, prev_style)), Inline::Text(t, st)) =
+        (inlines.last_mut(), &inline)
+    {
+        if prev_style == st {
+            prev.push_str(t);
+            return;
+        }
+    }
+    inlines.push(inline);
+}
+
+fn heading_level(level: HeadingLevel) -> u8 {
+    match level {
+        HeadingLevel::H1 => 1,
+        HeadingLevel::H2 => 2,
+        HeadingLevel::H3 => 3,
+        HeadingLevel::H4 => 4,
+        HeadingLevel::H5 => 5,
+        HeadingLevel::H6 => 6,
+    }
+}
+
+/// A container frame on the open-container stack.
+enum Frame {
+    List(ListFrame),
+    Quote(Vec<Block>),
+    Table(TableFrame),
+}
+
+struct ListFrame {
+    list: List,
+    item: Option<ListItem>,
+}
+
+struct TableFrame {
+    table: Table,
+    row: Vec<String>,
+    in_header: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn blocks(src: &str) -> Vec<Block> {
+        parse(src)
+    }
+
+    #[test]
+    fn parses_heading_and_paragraph() {
+        let b = blocks("# Title\n\nbody text");
+        assert!(matches!(b[0], Block::Heading { level: 1, .. }));
+        assert!(matches!(b[1], Block::Paragraph(_)));
+    }
+
+    #[test]
+    fn separates_inline_code_from_text() {
+        let b = blocks("a `b` c");
+        let Block::Paragraph(inlines) = &b[0] else {
+            panic!("not a paragraph");
+        };
+        // Plain text "a " then code "b" then plain " c".
+        assert_eq!(inlines.len(), 3);
+        assert!(matches!(inlines[0], Inline::Text(_, _)));
+        assert!(matches!(inlines[1], Inline::Code(_)));
+        assert!(matches!(inlines[2], Inline::Text(_, _)));
+    }
+
+    #[test]
+    fn merges_adjacent_text_runs() {
+        // Bold + plain text both emit Text events that should merge.
+        let b = blocks("**bold** and plain");
+        let Block::Paragraph(inlines) = &b[0] else {
+            panic!("not a paragraph");
+        };
+        assert_eq!(inlines.len(), 1, "adjacent text runs merged: {inlines:?}");
+    }
+
+    #[test]
+    fn parses_unordered_list_with_nesting() {
+        let b = blocks("- a\n- b\n  - c\n- d");
+        let list = b
+            .iter()
+            .find_map(|x| if let Block::List(l) = x { Some(l) } else { None })
+            .expect("a list");
+        assert!(!list.ordered);
+        assert_eq!(list.items.len(), 3);
+        // The parent item keeps its own text ("b"), separate from the nested
+        // child ("c") — a regression guard for the shared inline buffer.
+        assert_eq!(
+            list.items[1].inlines,
+            vec![Inline::Text("b".to_string(), SpanStyle::default())]
+        );
+        assert_eq!(list.items[1].children.len(), 1);
+        let nested = list.items[1].children.first().unwrap();
+        let Block::List(nested_list) = nested else {
+            panic!("expected nested list, got {nested:?}");
+        };
+        assert_eq!(nested_list.items.len(), 1);
+        assert_eq!(
+            nested_list.items[0].inlines,
+            vec![Inline::Text("c".to_string(), SpanStyle::default())]
+        );
+    }
+
+    #[test]
+    fn parses_ordered_list() {
+        let b = blocks("1. one\n2. two\n3. three");
+        let list = b
+            .iter()
+            .find_map(|x| if let Block::List(l) = x { Some(l) } else { None })
+            .expect("a list");
+        assert!(list.ordered);
+        assert_eq!(list.items.len(), 3);
+    }
+
+    #[test]
+    fn parses_task_list_markers() {
+        let b = blocks("- [x] done\n- [ ] todo");
+        let list = b
+            .iter()
+            .find_map(|x| if let Block::List(l) = x { Some(l) } else { None })
+            .expect("a list");
+        assert_eq!(list.items[0].checked, Some(true));
+        assert_eq!(list.items[1].checked, Some(false));
+    }
+
+    #[test]
+    fn parses_code_block_with_lang() {
+        let b = blocks("```rust\nfn main() {}\n```");
+        let code = b
+            .iter()
+            .find_map(|x| if let Block::CodeBlock { lang, code } = x {
+                Some((lang.clone(), code.clone()))
+            } else {
+                None
+            })
+            .expect("a code block");
+        assert_eq!(code.0.as_deref(), Some("rust"));
+        assert!(code.1.contains("fn main()"));
+    }
+
+    #[test]
+    fn parses_blockquote() {
+        let b = blocks("> quoted\n> still quoted");
+        assert!(matches!(b[0], Block::BlockQuote(_)));
+    }
+
+    #[test]
+    fn parses_rule() {
+        let b = blocks("a\n\n---\n\nb");
+        assert!(b.iter().any(|x| matches!(x, Block::Rule)));
+    }
+
+    #[test]
+    fn parses_table() {
+        let src = "| H1 | H2 |\n|----|----|\n| a  | b  |\n| c  | d  |";
+        let b = blocks(src);
+        let table = b
+            .iter()
+            .find_map(|x| if let Block::Table(t) = x { Some(t) } else { None })
+            .expect("a table");
+        assert_eq!(table.headers, vec!["H1".to_string(), "H2".to_string()]);
+        assert_eq!(table.rows.len(), 2);
+        assert_eq!(table.rows[0], vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn parses_inline_math_as_inline_leaf() {
+        // Inline math mixed with text stays an inline leaf inside the paragraph.
+        let b = blocks("energy is $E=mc^2$ here");
+        let Block::Paragraph(inlines) = &b[0] else {
+            panic!("expected a paragraph, got {b:?}");
+        };
+        let math = inlines
+            .iter()
+            .find_map(|i| if let Inline::Math(s) = i { Some(s.clone()) } else { None })
+            .expect("an inline math leaf");
+        assert_eq!(math, "E=mc^2");
+    }
+
+    #[test]
+    fn parses_display_math_as_block() {
+        // A $$...$$ run alone in its paragraph is promoted to a block-level Math.
+        let b = blocks("intro\n\n$$\\int_0^1 x\\,dx$$\n\noutro");
+        let math = b
+            .iter()
+            .find_map(|x| if let Block::Math(s) = x { Some(s.clone()) } else { None })
+            .expect("a block-level Math");
+        assert!(math.contains("\\int_0^1"), "math source preserved: {math}");
+    }
+}

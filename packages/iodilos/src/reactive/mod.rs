@@ -17,30 +17,6 @@
 //!     assert_eq!(display_text.get_clone(), "Hello Sycamore!");
 //! });
 //! ```
-//!
-//! # A note on `nightly`
-//!
-//! If you are using rust `nightly`, you can enable the `nightly` feature to enable the more terse
-//! syntax for signal get/set.
-//!
-//! ```ignore
-//! # use iodilos::reactive::*;
-//! # create_root(|| {
-//! let signal = create_signal(123);
-//!
-//! // Stable:
-//! let value = signal.get();
-//! signal.set(456);
-//!
-//! // Nightly:
-//! let value = signal();
-//! signal(456);
-//! # });
-//! ```
-//!
-//! Of course, the stable `.get()` also works on nightly as well if that's what you prefer.
-
-#![cfg_attr(feature = "nightly", feature(fn_traits, unboxed_closures))]
 
 mod context;
 mod effects;

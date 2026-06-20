@@ -110,13 +110,12 @@ impl Parse for TagIdent {
 
 impl Parse for Prop {
     fn parse(input: ParseStream) -> Result<Self> {
-        let span = input.span();
         let ty = input.parse()?;
         if !matches!(ty, PropType::Spread) {
             let _eqs: Token![=] = input.parse()?;
         }
         let value = input.parse()?;
-        Ok(Self { ty, value, span })
+        Ok(Self { ty, value })
     }
 }
 

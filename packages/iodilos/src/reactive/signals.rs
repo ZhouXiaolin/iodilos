@@ -652,15 +652,6 @@ impl<T: fmt::Display> fmt::Display for Signal<T> {
     }
 }
 
-#[cfg(feature = "nightly")]
-impl<T: Copy> FnOnce<()> for ReadSignal<T> {
-    type Output = T;
-
-    extern "rust-call" fn call_once(self, _args: ()) -> Self::Output {
-        self.get()
-    }
-}
-
 impl<T: AddAssign<Rhs>, Rhs> AddAssign<Rhs> for Signal<T> {
     fn add_assign(&mut self, rhs: Rhs) {
         self.update(|this| *this += rhs);
@@ -684,26 +675,6 @@ impl<T: DivAssign<Rhs>, Rhs> DivAssign<Rhs> for Signal<T> {
 impl<T: RemAssign<Rhs>, Rhs> RemAssign<Rhs> for Signal<T> {
     fn rem_assign(&mut self, rhs: Rhs) {
         self.update(|this| *this %= rhs);
-    }
-}
-
-// We need to implement this again for `Signal` despite `Signal` deref-ing to `ReadSignal` since
-// we also have another implementation of `FnOnce` for `Signal`.
-#[cfg(feature = "nightly")]
-impl<T: Copy> FnOnce<()> for Signal<T> {
-    type Output = T;
-
-    extern "rust-call" fn call_once(self, _args: ()) -> Self::Output {
-        self.get()
-    }
-}
-
-#[cfg(feature = "nightly")]
-impl<T: Copy> FnOnce<(T,)> for Signal<T> {
-    type Output = T;
-
-    extern "rust-call" fn call_once(self, (val,): (T,)) -> Self::Output {
-        self.replace(val)
     }
 }
 

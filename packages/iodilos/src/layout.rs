@@ -98,8 +98,9 @@ struct BuiltNode {
 }
 
 #[derive(Debug, Clone)]
-struct Measure {
-    text: String,
+enum Measure {
+    Text { text: String },
+    Lines { lines: Vec<crate::text::Line> },
 }
 
 #[derive(Debug)]
@@ -216,8 +217,9 @@ pub(crate) fn render(
             height: AvailableSpace::Definite(area.height as f32),
         },
         |known, available, _node, context, _style| {
-            context.map_or(Size::ZERO, |context| {
-                measure_text(&context.text, known, available)
+            context.map_or(Size::ZERO, |ctx| match ctx {
+                Measure::Text { text } => measure_text(text, known, available),
+                Measure::Lines { lines } => measure_lines(lines, known, available),
             })
         },
     );
@@ -251,9 +253,7 @@ fn build_node(
             let taffy_id = tree
                 .new_leaf_with_context(
                     taffy::style::Style::default(),
-                    Measure { text: lines_snapshot.iter().map(|l| {
-                        l.spans.iter().map(|s| s.content.as_ref()).collect::<String>()
-                    }).collect::<Vec<_>>().join("\n") },
+                    Measure::Lines { lines: lines_snapshot.clone() },
                 )
                 .expect("create lineflow leaf");
             Some(BuiltNode {
@@ -273,7 +273,7 @@ fn build_node(
             let taffy_id = tree
                 .new_leaf_with_context(
                     taffy::style::Style::default(),
-                    Measure { text: text.clone() },
+                    Measure::Text { text: text.clone() },
                 )
                 .expect("create text node");
             Some(BuiltNode {
@@ -293,7 +293,7 @@ fn build_node(
             let taffy_id = tree
                 .new_leaf_with_context(
                     taffy::style::Style::default(),
-                    Measure { text: text.clone() },
+                    Measure::Text { text: text.clone() },
                 )
                 .expect("create dynamic text node");
             Some(BuiltNode {
@@ -343,7 +343,7 @@ fn build_node(
             let focusable = is_focusable(node);
             if leaf {
                 let taffy_id = tree
-                    .new_leaf_with_context(style.to_taffy(), Measure { text: display_text })
+                    .new_leaf_with_context(style.to_taffy(), Measure::Text { text: display_text })
                     .expect("create element leaf");
                 Some(BuiltNode {
                     runtime_id: element.id,
@@ -716,6 +716,25 @@ fn measure_text(
             1.0
         };
         lines.max(wrapped)
+    });
+    Size { width, height }
+}
+
+/// Measure a `LineFlow`'s lines: width is the longest raw line (capped at the
+/// available width), height is the wrapped row count.
+fn measure_lines(
+    lines: &[crate::text::Line],
+    known: Size<Option<f32>>,
+    available: Size<AvailableSpace>,
+) -> Size<f32> {
+    let raw_width = lines.iter().map(|l| l.width() as f32).fold(0.0_f32, f32::max);
+    let available_width = match available.width {
+        AvailableSpace::Definite(w) => w.max(1.0),
+        AvailableSpace::MinContent | AvailableSpace::MaxContent => raw_width.max(1.0),
+    };
+    let width = known.width.unwrap_or(raw_width.min(available_width).max(1.0));
+    let height = known.height.unwrap_or_else(|| {
+        wrap_lines(lines, width as usize, SpanStyle::default()).len() as f32
     });
     Size { width, height }
 }
@@ -1174,5 +1193,24 @@ mod tests {
         // First grapheme unstyled, second carries BOLD.
         assert!(!rows[0][0].1.add_modifier.contains(Modifier::BOLD));
         assert!(rows[0][1].1.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn lineflow_measures_wrapped_height() {
+        use crate::text::{Line, Span};
+        use crate::view::ViewTuiNode;
+        let mut nodes = Vec::new();
+        let root = crate::reactive::create_root(|| {
+            let view: View = tags::div()
+                .width(3)
+                .children(View::from_node(TuiNode::create_line_flow_node(
+                    vec![Line::from(Span::raw("abcdef"))],
+                    0,
+                )))
+                .into();
+            nodes = view.nodes.into_iter().collect();
+        });
+        let (_canvas, _index) = render(&nodes, Rect::new(0, 0, 3, 10), None);
+        root.dispose();
     }
 }

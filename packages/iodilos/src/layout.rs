@@ -846,7 +846,10 @@ fn is_text_leaf(tag: &str, children: &[TuiNode]) -> bool {
         || children.iter().all(|child| {
             matches!(
                 child,
-                TuiNode::TextStatic { .. } | TuiNode::TextDynamic { .. } | TuiNode::Marker { .. }
+                TuiNode::TextStatic { .. }
+                    | TuiNode::TextDynamic { .. }
+                    | TuiNode::LineFlow { .. }
+                    | TuiNode::Marker { .. }
             )
         })
 }
@@ -1341,6 +1344,22 @@ mod tests {
                 );
             }
         }
+        root.dispose();
+    }
+
+    #[test]
+    fn element_with_lineflow_child_is_text_leaf() {
+        use crate::text::Line;
+        let mut nodes = Vec::new();
+        let root = crate::reactive::create_root(|| {
+            let view: View = tags::button()
+                .children(View::from(Line::raw("hi")))
+                .into();
+            nodes = view.nodes.into_iter().collect();
+        });
+        let (canvas, _index) = render(&nodes, Rect::new(0, 0, 10, 1), None);
+        let painted = canvas_to_plain_text(&canvas);
+        assert!(painted.contains("[ hi ]"), "button chrome should paint: {painted}");
         root.dispose();
     }
 }

@@ -1294,7 +1294,7 @@ mod tests {
             ]);
             let view: View = tags::div()
                 .width(20)
-                .children(View::from(vec![line]))
+                .children(View::from(line))
                 .into();
             nodes = view.nodes.into_iter().collect();
         });
@@ -1326,7 +1326,7 @@ mod tests {
             )]);
             let view: View = tags::div()
                 .width(3)
-                .children(View::from(vec![line]))
+                .children(View::from(line))
                 .into();
             nodes = view.nodes.into_iter().collect();
         });

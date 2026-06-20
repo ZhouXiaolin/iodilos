@@ -130,12 +130,6 @@ impl<T: ViewTuiNode> From<crate::text::Line> for View<T> {
     }
 }
 
-impl<T: ViewTuiNode> From<Vec<crate::text::Line>> for View<T> {
-    fn from(lines: Vec<crate::text::Line>) -> Self {
-        View::from_node(T::create_line_flow_node(lines, 0))
-    }
-}
-
 impl<T: ViewNode, F: FnMut() -> U + 'static, U: Into<View<T>> + 'static> From<F> for View<T> {
     fn from(f: F) -> Self {
         T::create_dynamic_view(f)

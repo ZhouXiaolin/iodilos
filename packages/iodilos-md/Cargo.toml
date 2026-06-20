@@ -1,0 +1,23 @@
+[package]
+name = "iodilos-md"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+description = "A streaming-friendly Markdown component library for iodilos TUI"
+
+[lib]
+name = "iodilos_md"
+path = "src/lib.rs"
+
+[dependencies]
+iodilos = { path = "../iodilos" }
+# crossterm is re-exported by iodilos as its color type; we depend on it
+# directly so we can name `crossterm::style::Color` for the highlighter output.
+crossterm = "0.29"
+pulldown-cmark = { version = "0.12", default-features = false, features = ["simd"] }
+unicode-width = "0.2"
+# `default-syntaxes`/`default-themes` ship the grammar + theme sets; `parsing`
+# enables the parser; `default-fancy` is the pure-Rust regex engine (no onig
+# system dep). All under `default-features = false` to stay lean.
+syntect = { version = "5.2", default-features = false, features = ["default-syntaxes", "default-themes", "parsing", "default-fancy"] }

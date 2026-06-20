@@ -62,37 +62,6 @@ impl SpanStyle {
     }
 }
 
-/// Bridge from the legacy scalar `TextStyle` (used by the box `Style`'s text
-/// fields) to `SpanStyle`. The box's resolved text style is the *base* onto
-/// which each `Span`'s style patches during paint.
-impl From<crate::style::TextStyle> for SpanStyle {
-    fn from(t: crate::style::TextStyle) -> Self {
-        use crate::style::Weight;
-        let mut add = Modifier::empty();
-        match t.weight {
-            Weight::Bold => add |= Modifier::BOLD,
-            Weight::Light => add |= Modifier::DIM,
-            Weight::Normal => {}
-        }
-        if t.underline {
-            add |= Modifier::UNDERLINED;
-        }
-        if t.italic {
-            add |= Modifier::ITALIC;
-        }
-        if t.invert {
-            add |= Modifier::REVERSED;
-        }
-        SpanStyle {
-            fg: t.color,
-            bg: None,
-            underline_color: None,
-            add_modifier: add,
-            sub_modifier: Modifier::empty(),
-        }
-    }
-}
-
 /// Horizontal alignment of a [`Line`] within its area. Mirrors
 /// `ratatui_core::layout::Alignment`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -249,23 +218,6 @@ mod tests {
         };
         let p = base.patch(SpanStyle::default());
         assert_eq!(p.bg, Some(Color::Green));
-    }
-
-    #[test]
-    fn spanstyle_from_legacy_textstyle_maps_scalars() {
-        let ts = crate::style::TextStyle {
-            color: Some(Color::Yellow),
-            weight: crate::style::Weight::Bold,
-            underline: true,
-            italic: true,
-            invert: false,
-        };
-        let s = SpanStyle::from(ts);
-        assert_eq!(s.fg, Some(Color::Yellow));
-        assert!(s.add_modifier.contains(Modifier::BOLD));
-        assert!(s.add_modifier.contains(Modifier::UNDERLINED));
-        assert!(s.add_modifier.contains(Modifier::ITALIC));
-        assert!(!s.add_modifier.contains(Modifier::REVERSED));
     }
 
     #[test]

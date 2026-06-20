@@ -39,7 +39,7 @@ pub use reactive::*;
 pub use render::{render, render_async, use_future};
 pub use style::{
     BorderCharacters, BorderStyle, Edges, FlexBasis, Gap, Inset, Margin, Padding, Percent, Size,
-    Style, TextStyle, Weight,
+    Style, Weight,
 };
 pub use view::{View, ViewNode, ViewTuiNode};
 pub use text::{Alignment, Line, Modifier, Span, SpanStyle};
@@ -72,7 +72,7 @@ pub mod prelude {
     pub use crate::render::{render, render_async, use_future};
     pub use crate::style::{
         BorderCharacters, BorderStyle, Edges, FlexBasis, Gap, Inset, Margin, Padding, Percent,
-        Size, Style, TextStyle, Weight,
+        Size, Style, Weight,
     };
     pub use crate::view::{View, ViewNode, ViewTuiNode};
     pub use crate::{bind, events};

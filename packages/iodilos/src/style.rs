@@ -381,41 +381,6 @@ impl BorderStyle {
     }
 }
 
-/// Inheritable text paint properties. `color`, `weight`, `decoration`,
-/// `italic`, and `invert` resolve by walking the ancestor chain (nearer
-/// wins), per HTML/CSS inheritance semantics.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct TextStyle {
-    /// The text color.
-    pub color: Option<Color>,
-    /// The text weight.
-    pub weight: Weight,
-    /// Whether the text is underlined.
-    pub underline: bool,
-    /// Whether the text is italicized.
-    pub italic: bool,
-    /// Whether the text is rendered with reversed foreground/background.
-    pub invert: bool,
-}
-
-impl TextStyle {
-    /// Resolve this style against a parent: for each field, if this value is
-    /// "unset" (None / Normal / false), take the parent's value.
-    pub(crate) fn inherit(self, parent: TextStyle) -> TextStyle {
-        TextStyle {
-            color: self.color.or(parent.color),
-            weight: if self.weight == Weight::Normal && parent.weight != Weight::Normal {
-                parent.weight
-            } else {
-                self.weight
-            },
-            underline: self.underline || parent.underline,
-            italic: self.italic || parent.italic,
-            invert: self.invert || parent.invert,
-        }
-    }
-}
-
 /// The author-facing flat style surface. Each field is one named style
 /// property. All fields accept `MaybeDyn` at the attribute layer; this struct
 /// holds the statically-resolved value used by layout and paint.
@@ -750,24 +715,5 @@ mod tests {
 
         let none = Style::default();
         assert!(none.to_taffy().border == Rect::zero());
-    }
-
-    #[test]
-    fn text_paint_inherits_along_ancestor_chain() {
-        let parent = TextStyle {
-            color: Some(Color::Blue),
-            weight: Weight::Bold,
-            italic: true,
-            ..TextStyle::default()
-        };
-        // Child only sets color; it inherits weight and italic from the parent.
-        let child = TextStyle {
-            color: Some(Color::Yellow),
-            ..TextStyle::default()
-        };
-        let resolved = child.inherit(parent);
-        assert_eq!(resolved.color, Some(Color::Yellow)); // nearer wins
-        assert_eq!(resolved.weight, Weight::Bold); // inherited
-        assert!(resolved.italic); // inherited
     }
 }

@@ -619,10 +619,7 @@ fn default_container_style() -> taffy::style::Style {
 
 fn default_style_for_tag(tag: &str) -> Style {
     let mut style = Style::default();
-    if matches!(
-        tag,
-        "div" | "section" | "main" | "header" | "footer" | "ul" | "li"
-    ) {
+    if tag == "div" {
         style.flex_direction = FlexDirection::Column;
     }
     if tag == "input" {

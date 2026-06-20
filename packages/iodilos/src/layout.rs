@@ -272,27 +272,6 @@ fn build_node(
                 line_flow: Some((lines_snapshot, offset_value)),
             })
         }
-        TuiNode::TextStatic { id, text } => {
-            let text = text.to_string();
-            let taffy_id = tree
-                .new_leaf_with_context(
-                    taffy::style::Style::default(),
-                    Measure::Text { text: text.clone() },
-                )
-                .expect("create text node");
-            Some(BuiltNode {
-                runtime_id: *id,
-                taffy_id,
-                parent,
-                tag: None,
-                text,
-                style: Style::default(),
-                focusable: false,
-                text_leaf: false,
-                children: Vec::new(),
-                line_flow: None,
-            })
-        }
         TuiNode::TextDynamic { id, text } => {
             let text = text.borrow().clone();
             let taffy_id = tree
@@ -843,15 +822,15 @@ fn default_style_for_tag(tag: &str) -> Style {
 
 fn is_text_leaf(tag: &str, children: &[TuiNode]) -> bool {
     matches!(tag, "span" | "p" | "input")
-        || children.iter().all(|child| {
-            matches!(
-                child,
-                TuiNode::TextStatic { .. }
-                    | TuiNode::TextDynamic { .. }
-                    | TuiNode::LineFlow { .. }
-                    | TuiNode::Marker { .. }
-            )
-        })
+        || (tag == "button"
+            && children.iter().all(|child| {
+                matches!(
+                    child,
+                    TuiNode::TextDynamic { .. }
+                        | TuiNode::LineFlow { .. }
+                        | TuiNode::Marker { .. }
+                )
+            }))
 }
 
 fn element_text(node: &TuiNode) -> String {

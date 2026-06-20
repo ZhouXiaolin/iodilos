@@ -67,10 +67,6 @@ pub struct ElementNode {
 /// A node in the retained TUI view tree.
 pub enum TuiNode {
     Element(Box<ElementNode>),
-    TextStatic {
-        id: NodeId,
-        text: Cow<'static, str>,
-    },
     TextDynamic {
         id: NodeId,
         text: Rc<RefCell<String>>,
@@ -96,8 +92,7 @@ impl TuiNode {
     pub fn id(&self) -> NodeId {
         match self {
             TuiNode::Element(element) => element.id,
-            TuiNode::TextStatic { id, .. }
-            | TuiNode::TextDynamic { id, .. }
+            TuiNode::TextDynamic { id, .. }
             | TuiNode::Marker { id }
             | TuiNode::Dynamic { id, .. }
             | TuiNode::LineFlow { id, .. } => *id,
@@ -143,7 +138,6 @@ impl TuiNode {
 
     pub(crate) fn collect_text(&self, out: &mut String) {
         match self {
-            TuiNode::TextStatic { text, .. } => out.push_str(text),
             TuiNode::TextDynamic { text, .. } => out.push_str(&text.borrow()),
             TuiNode::Element(element) => {
                 for child in &element.children {
@@ -213,11 +207,6 @@ impl std::fmt::Debug for TuiNode {
                 .field("id", &element.id)
                 .field("tag", &element.tag)
                 .finish_non_exhaustive(),
-            TuiNode::TextStatic { id, text } => f
-                .debug_struct("TextStatic")
-                .field("id", id)
-                .field("text", text)
-                .finish(),
             TuiNode::TextDynamic { id, .. } => f
                 .debug_struct("TextDynamic")
                 .field("id", id)
@@ -301,10 +290,7 @@ impl ViewTuiNode for TuiNode {
     }
 
     fn create_text_node(text: Cow<'static, str>) -> Self {
-        Self::TextStatic {
-            id: NodeId::next(),
-            text,
-        }
+        Self::create_line_flow_node(vec![crate::text::Line::raw(text)], 0)
     }
 
     fn create_dynamic_text_node(text: Cow<'static, str>) -> Self {

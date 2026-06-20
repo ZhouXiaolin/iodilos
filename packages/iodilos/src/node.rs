@@ -242,19 +242,21 @@ impl ViewNode for TuiNode {
         mut f: impl FnMut() -> U + 'static,
     ) -> View<Self> {
         if TypeId::of::<U>() == TypeId::of::<String>() {
-            let text = Rc::new(RefCell::new(String::new()));
+            let lines = Rc::new(RefCell::new(Vec::<crate::text::Line>::new()));
             create_effect({
-                let text = Rc::clone(&text);
+                let lines = Rc::clone(&lines);
                 move || {
                     let mut value = Some(f());
                     let value: &mut Option<String> =
                         (&mut value as &mut dyn Any).downcast_mut().unwrap();
-                    *text.borrow_mut() = value.take().unwrap();
+                    let s = value.take().unwrap();
+                    *lines.borrow_mut() = vec![crate::text::Line::raw(s)];
                 }
             });
-            View::from(TuiNode::TextDynamic {
+            View::from(TuiNode::LineFlow {
                 id: NodeId::next(),
-                text,
+                lines,
+                offset: Rc::new(RefCell::new(0)),
             })
         } else {
             let view = Rc::new(RefCell::new(View::new()));
@@ -347,5 +349,23 @@ mod tests {
         assert_eq!(*offset.borrow(), 0);
         *offset.borrow_mut() = 3;
         assert_eq!(*offset.borrow(), 3);
+    }
+
+    #[test]
+    fn dynamic_string_becomes_lineflow_that_updates() {
+        use crate::reactive::create_root;
+        use crate::view::View;
+        let root = create_root(|| {
+            let sig = crate::reactive::create_signal("a".to_string());
+            let view: View = (move || sig.get_clone()).into();
+            // The dynamic node is a LineFlow whose lines track the signal.
+            let node = &view.nodes()[0];
+            let line_count = match node {
+                TuiNode::LineFlow { lines, .. } => lines.borrow().len(),
+                _ => panic!("expected LineFlow, got {node:?}"),
+            };
+            assert_eq!(line_count, 1, "one line for \"a\"");
+        });
+        root.dispose();
     }
 }

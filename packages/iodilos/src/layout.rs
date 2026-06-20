@@ -246,6 +246,28 @@ fn build_node(
 ) -> Option<BuiltNode> {
     match node {
         TuiNode::Marker { .. } => None,
+        TuiNode::LineFlow { id, lines, .. } => {
+            let lines_snapshot = lines.borrow().clone();
+            let taffy_id = tree
+                .new_leaf_with_context(
+                    taffy::style::Style::default(),
+                    Measure { text: lines_snapshot.iter().map(|l| {
+                        l.spans.iter().map(|s| s.content.as_ref()).collect::<String>()
+                    }).collect::<Vec<_>>().join("\n") },
+                )
+                .expect("create lineflow leaf");
+            Some(BuiltNode {
+                runtime_id: *id,
+                taffy_id,
+                parent,
+                tag: None,
+                text: String::new(),
+                style: Style::default(),
+                focusable: false,
+                text_leaf: false,
+                children: Vec::new(),
+            })
+        }
         TuiNode::TextStatic { id, text } => {
             let text = text.to_string();
             let taffy_id = tree

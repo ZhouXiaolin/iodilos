@@ -11,6 +11,7 @@ use crate::reactive::create_effect;
 use crate::attributes::{BoolAttribute, StringAttribute};
 use crate::events::Event;
 use crate::style::Style;
+use crate::text::Line;
 use crate::view::{View, ViewNode, ViewTuiNode};
 
 static NEXT_NODE_ID: AtomicU64 = AtomicU64::new(1);
@@ -81,6 +82,14 @@ pub enum TuiNode {
         id: NodeId,
         view: Rc<RefCell<View<TuiNode>>>,
     },
+    /// A flat line-buffer text leaf. Holds an arbitrary number of styled lines
+    /// plus a scroll offset (rows). Laid out by taffy as a single leaf; painted
+    /// only across the visible `[offset, offset+rect.height)` rows.
+    LineFlow {
+        id: NodeId,
+        lines: Rc<RefCell<Vec<Line>>>,
+        offset: Rc<RefCell<i32>>,
+    },
 }
 
 impl TuiNode {
@@ -90,7 +99,8 @@ impl TuiNode {
             TuiNode::TextStatic { id, .. }
             | TuiNode::TextDynamic { id, .. }
             | TuiNode::Marker { id }
-            | TuiNode::Dynamic { id, .. } => *id,
+            | TuiNode::Dynamic { id, .. }
+            | TuiNode::LineFlow { id, .. } => *id,
         }
     }
 
@@ -146,6 +156,13 @@ impl TuiNode {
                 }
             }
             TuiNode::Marker { .. } => {}
+            TuiNode::LineFlow { lines, .. } => {
+                for line in lines.borrow().iter() {
+                    for span in &line.spans {
+                        out.push_str(span.content.as_ref());
+                    }
+                }
+            }
         }
     }
 
@@ -208,6 +225,10 @@ impl std::fmt::Debug for TuiNode {
             TuiNode::Marker { id } => f.debug_struct("Marker").field("id", id).finish(),
             TuiNode::Dynamic { id, .. } => f
                 .debug_struct("Dynamic")
+                .field("id", id)
+                .finish_non_exhaustive(),
+            TuiNode::LineFlow { id, .. } => f
+                .debug_struct("LineFlow")
                 .field("id", id)
                 .finish_non_exhaustive(),
         }
@@ -296,6 +317,14 @@ impl ViewTuiNode for TuiNode {
     fn create_marker_node() -> Self {
         Self::Marker { id: NodeId::next() }
     }
+
+    fn create_line_flow_node(lines: Vec<crate::text::Line>, offset: i32) -> Self {
+        Self::LineFlow {
+            id: NodeId::next(),
+            lines: Rc::new(RefCell::new(lines)),
+            offset: Rc::new(RefCell::new(offset)),
+        }
+    }
 }
 
 /// A builder wrapper that exposes a mutable TUI node.
@@ -306,5 +335,31 @@ pub trait AsTuiNode {
 impl AsTuiNode for TuiNode {
     fn as_tui_node(&mut self) -> &mut TuiNode {
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lineflow_node_holds_lines_and_offset() {
+        let lines = Rc::new(RefCell::new(vec![
+            crate::text::Line::raw("hello"),
+        ]));
+        let offset = Rc::new(RefCell::new(0i32));
+        let node = TuiNode::LineFlow {
+            id: NodeId::next(),
+            lines: lines.clone(),
+            offset: offset.clone(),
+        };
+        // collect_text reads the current lines.
+        let mut s = String::new();
+        node.collect_text(&mut s);
+        assert_eq!(s, "hello");
+        // offset is readable and mutable through the shared cell.
+        assert_eq!(*offset.borrow(), 0);
+        *offset.borrow_mut() = 3;
+        assert_eq!(*offset.borrow(), 3);
     }
 }

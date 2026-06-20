@@ -124,6 +124,18 @@ impl_view_from_to_string!(
     i8, i16, i32, i64, i128, isize, u8, u16, u32, u64, u128, usize, f32, f64
 );
 
+impl<T: ViewTuiNode> From<crate::text::Line> for View<T> {
+    fn from(line: crate::text::Line) -> Self {
+        View::from_node(T::create_line_flow_node(vec![line], 0))
+    }
+}
+
+impl<T: ViewTuiNode> From<Vec<crate::text::Line>> for View<T> {
+    fn from(lines: Vec<crate::text::Line>) -> Self {
+        View::from_node(T::create_line_flow_node(lines, 0))
+    }
+}
+
 impl<T: ViewNode, F: FnMut() -> U + 'static, U: Into<View<T>> + 'static> From<F> for View<T> {
     fn from(f: F) -> Self {
         T::create_dynamic_view(f)
@@ -185,4 +197,6 @@ pub trait ViewTuiNode: ViewNode {
         Self::create_text_node(text)
     }
     fn create_marker_node() -> Self;
+    /// Build a `LineFlow` node from `lines` with the given initial `offset`.
+    fn create_line_flow_node(lines: Vec<crate::text::Line>, offset: i32) -> Self;
 }

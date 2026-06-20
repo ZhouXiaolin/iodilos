@@ -720,6 +720,48 @@ fn measure_text(
     Size { width, height }
 }
 
+/// Wrap `lines` at `width` cells into physical rows. Each output row is a list
+/// of `(grapheme_string, resolved_style)` pairs, where the resolved style is
+/// `base.patch(line.style).patch(span.style)`. Shared by measure (row count)
+/// and paint (draw) so they agree on where breaks fall. Character-level breaks
+/// (no word-boundary preference) — sufficient for Plan 1; Plan 3 may refine.
+fn wrap_lines(
+    lines: &[crate::text::Line],
+    width: usize,
+    base: SpanStyle,
+) -> Vec<Vec<(String, SpanStyle)>> {
+    use unicode_width::UnicodeWidthChar;
+    let width = width.max(1);
+    let mut rows: Vec<Vec<(String, SpanStyle)>> = Vec::new();
+    for line in lines {
+        let line_base = base.patch(line.style);
+        let mut row: Vec<(String, SpanStyle)> = Vec::new();
+        let mut col = 0usize;
+        for span in &line.spans {
+            let resolved = line_base.patch(span.style);
+            for ch in span.content.chars() {
+                if ch == '\n' {
+                    rows.push(std::mem::take(&mut row));
+                    col = 0;
+                    continue;
+                }
+                let cw = UnicodeWidthChar::width(ch).unwrap_or(0).max(1);
+                if col + cw > width && !row.is_empty() {
+                    rows.push(std::mem::take(&mut row));
+                    col = 0;
+                }
+                row.push((ch.to_string(), resolved));
+                col += cw;
+            }
+        }
+        rows.push(row);
+    }
+    if rows.is_empty() {
+        rows.push(Vec::new());
+    }
+    rows
+}
+
 fn rect_from_layout(layout: &taffy::Layout, parent_rect: PaintRect) -> PaintRect {
     let x = parent_rect.x as f32 + layout.location.x;
     let y = parent_rect.y as f32 + layout.location.y;
@@ -1098,5 +1140,39 @@ mod tests {
             "covered text must not bleed through the background: {row0:?}"
         );
         root.dispose();
+    }
+
+    #[test]
+    fn wrap_lines_breaks_at_width() {
+        use crate::text::{Line, Span, SpanStyle};
+        let lines = vec![Line::from(Span::raw("abcdef"))]; // width 6
+        let rows = wrap_lines(
+            &lines,
+            3,
+            SpanStyle::default(),
+        );
+        // 6 chars at width 3 → 2 rows.
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0][0].0, "a");
+        assert_eq!(rows[0][1].0, "b");
+        assert_eq!(rows[0][2].0, "c");
+        assert_eq!(rows[1][0].0, "d");
+    }
+
+    #[test]
+    fn wrap_lines_resolves_per_span_style_patched_on_base() {
+        use crate::text::{Line, Span, SpanStyle, Modifier};
+        let line = Line::from(vec![
+            Span::raw("a"),
+            Span::styled("b", SpanStyle {
+                add_modifier: Modifier::BOLD,
+                ..SpanStyle::default()
+            }),
+        ]);
+        let rows = wrap_lines(&[line], 10, SpanStyle::default());
+        assert_eq!(rows.len(), 1);
+        // First grapheme unstyled, second carries BOLD.
+        assert!(!rows[0][0].1.add_modifier.contains(Modifier::BOLD));
+        assert!(rows[0][1].1.add_modifier.contains(Modifier::BOLD));
     }
 }

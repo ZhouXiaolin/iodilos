@@ -1275,4 +1275,72 @@ mod tests {
         assert!(!painted.contains('d'), "below viewport clipped: {painted}");
         root.dispose();
     }
+
+    #[test]
+    fn lineflow_paints_per_span_styles() {
+        use crate::text::{Line, Span, SpanStyle};
+        let mut nodes = Vec::new();
+        let root = crate::reactive::create_root(|| {
+            let line = Line::from(vec![
+                Span::raw("plain "),
+                Span::styled("bold", SpanStyle {
+                    add_modifier: crate::text::Modifier::BOLD,
+                    ..SpanStyle::default()
+                }),
+                Span::styled(" red", SpanStyle {
+                    fg: Some(crate::Color::Red),
+                    ..SpanStyle::default()
+                }),
+            ]);
+            let view: View = tags::div()
+                .width(20)
+                .children(View::from(vec![line]))
+                .into();
+            nodes = view.nodes.into_iter().collect();
+        });
+        let (canvas, _index) = render(&nodes, Rect::new(0, 0, 20, 1), None);
+        // "plain " occupies cols 0..6, "bold" cols 6..10, " red" cols 10..14.
+        let plain_cell = canvas.cell(0, 0).unwrap().character.as_ref().unwrap();
+        let bold_cell = canvas.cell(6, 0).unwrap().character.as_ref().unwrap();
+        let red_cell = canvas.cell(10, 0).unwrap().character.as_ref().unwrap();
+        assert_eq!(plain_cell.value, "p");
+        assert!(!plain_cell.style.add_modifier.contains(crate::text::Modifier::BOLD));
+        assert!(bold_cell.style.add_modifier.contains(crate::text::Modifier::BOLD));
+        assert_eq!(red_cell.style.fg, Some(crate::Color::Red));
+        root.dispose();
+    }
+
+    #[test]
+    fn lineflow_wrap_carries_style_across_break() {
+        use crate::text::{Line, Span, SpanStyle, Modifier};
+        // One span "ABCDEF" styled BOLD, width 3 → two rows "ABC" / "DEF".
+        // Both rows' graphemes must carry BOLD.
+        let mut nodes = Vec::new();
+        let root = crate::reactive::create_root(|| {
+            let line = Line::from(vec![Span::styled(
+                "ABCDEF",
+                SpanStyle {
+                    add_modifier: Modifier::BOLD,
+                    ..SpanStyle::default()
+                },
+            )]);
+            let view: View = tags::div()
+                .width(3)
+                .children(View::from(vec![line]))
+                .into();
+            nodes = view.nodes.into_iter().collect();
+        });
+        let (canvas, _index) = render(&nodes, Rect::new(0, 0, 3, 2), None);
+        for y in 0..2 {
+            for x in 0..3 {
+                let cell = canvas.cell(x, y).unwrap().character.as_ref().unwrap();
+                assert!(
+                    cell.style.add_modifier.contains(Modifier::BOLD),
+                    "grapheme at ({x},{y}) should be bold: {:?}",
+                    cell.style
+                );
+            }
+        }
+        root.dispose();
+    }
 }

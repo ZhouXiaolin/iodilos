@@ -95,6 +95,7 @@ struct BuiltNode {
     focusable: bool,
     text_leaf: bool,
     children: Vec<BuiltNode>,
+    line_flow: Option<(Vec<crate::text::Line>, i32)>,
 }
 
 #[derive(Debug, Clone)]
@@ -111,6 +112,7 @@ struct PaintNode {
     style: Style,
     text_leaf: bool,
     children: Vec<PaintNode>,
+    line_flow: Option<(Vec<crate::text::Line>, i32)>,
 }
 
 /// A rectangle in terminal-cell space, used inside the paint pipeline. Unlike
@@ -248,8 +250,9 @@ fn build_node(
 ) -> Option<BuiltNode> {
     match node {
         TuiNode::Marker { .. } => None,
-        TuiNode::LineFlow { id, lines, .. } => {
+        TuiNode::LineFlow { id, lines, offset } => {
             let lines_snapshot = lines.borrow().clone();
+            let offset_value = *offset.borrow();
             let taffy_id = tree
                 .new_leaf_with_context(
                     taffy::style::Style::default(),
@@ -266,6 +269,7 @@ fn build_node(
                 focusable: false,
                 text_leaf: false,
                 children: Vec::new(),
+                line_flow: Some((lines_snapshot, offset_value)),
             })
         }
         TuiNode::TextStatic { id, text } => {
@@ -286,6 +290,7 @@ fn build_node(
                 focusable: false,
                 text_leaf: false,
                 children: Vec::new(),
+                line_flow: None,
             })
         }
         TuiNode::TextDynamic { id, text } => {
@@ -306,6 +311,7 @@ fn build_node(
                 focusable: false,
                 text_leaf: false,
                 children: Vec::new(),
+                line_flow: None,
             })
         }
         TuiNode::Dynamic { id, view } => {
@@ -332,6 +338,7 @@ fn build_node(
                 focusable: false,
                 text_leaf: false,
                 children,
+                line_flow: None,
             })
         }
         TuiNode::Element(element) => {
@@ -355,6 +362,7 @@ fn build_node(
                     focusable,
                     text_leaf: true,
                     children: Vec::new(),
+                    line_flow: None,
                 })
             } else {
                 let built_children = element
@@ -379,6 +387,7 @@ fn build_node(
                     focusable,
                     text_leaf: false,
                     children: built_children,
+                    line_flow: None,
                 })
             }
         }
@@ -420,6 +429,7 @@ fn extract_node(
         style: built.style.clone(),
         text_leaf: built.text_leaf,
         children,
+        line_flow: built.line_flow.clone(),
     }
 }
 
@@ -484,6 +494,27 @@ fn paint_node(
             let display_text = display_text_for_tag(node.tag.as_deref(), &node.text);
             let span_style = SpanStyle::from(text);
             paint_text_clipped(canvas, node.rect, &display_text, span_style, clip);
+        }
+
+        if let Some((lines, offset)) = &node.line_flow {
+            let base = SpanStyle::from(text);
+            let width = node.rect.width as usize;
+            let rows = wrap_lines(lines, width, base);
+            let offset = (*offset).max(0) as usize;
+            let visible_height = node.rect.height as usize;
+            let clip_rect = intersect_rect(node.rect, clip).unwrap_or(PaintRect::ZERO);
+            for (i, row) in rows.iter().enumerate() {
+                if i < offset || i >= offset + visible_height {
+                    continue;
+                }
+                let y = node.rect.y + (i - offset) as i32;
+                if y < clip_rect.y || y >= clip_rect.bottom() {
+                    continue;
+                }
+                let segs: Vec<(&str, SpanStyle)> =
+                    row.iter().map(|(s, st)| (s.as_str(), *st)).collect();
+                canvas.set_segments(clip_rect.to_canvas_rect(), y as u16, &segs);
+            }
         }
     }
 
@@ -1211,6 +1242,37 @@ mod tests {
             nodes = view.nodes.into_iter().collect();
         });
         let (_canvas, _index) = render(&nodes, Rect::new(0, 0, 3, 10), None);
+        root.dispose();
+    }
+
+    #[test]
+    fn lineflow_paints_offset_window_only() {
+        use crate::text::{Line, Span};
+        use crate::view::ViewTuiNode;
+        let mut nodes = Vec::new();
+        let root = crate::reactive::create_root(|| {
+            let lines: Vec<Line> = vec![
+                Line::from(Span::raw("a")),
+                Line::from(Span::raw("b")),
+                Line::from(Span::raw("c")),
+                Line::from(Span::raw("d")),
+                Line::from(Span::raw("e")),
+            ];
+            let lf = TuiNode::create_line_flow_node(lines, 1);
+            let view: View = tags::div()
+                .width(5)
+                .height(2)
+                .overflow(taffy::style::Overflow::Hidden)
+                .children(View::from_node(lf))
+                .into();
+            nodes = view.nodes.into_iter().collect();
+        });
+        let (canvas, _index) = render(&nodes, Rect::new(0, 0, 5, 2), None);
+        let painted = canvas_to_plain_text(&canvas);
+        assert!(painted.contains('b'), "offset row 0 visible: {painted}");
+        assert!(painted.contains('c'), "offset row 1 visible: {painted}");
+        assert!(!painted.contains('a'), "scrolled-off head clipped: {painted}");
+        assert!(!painted.contains('d'), "below viewport clipped: {painted}");
         root.dispose();
     }
 }

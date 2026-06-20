@@ -93,6 +93,19 @@ impl From<crate::style::TextStyle> for SpanStyle {
     }
 }
 
+/// Horizontal alignment of a [`Line`] within its area. Mirrors
+/// `ratatui_core::layout::Alignment`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Alignment {
+    /// Left-aligned (the default).
+    #[default]
+    Left,
+    /// Centered.
+    Center,
+    /// Right-aligned.
+    Right,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -148,5 +161,10 @@ mod tests {
         assert!(s.add_modifier.contains(Modifier::UNDERLINED));
         assert!(s.add_modifier.contains(Modifier::ITALIC));
         assert!(!s.add_modifier.contains(Modifier::REVERSED));
+    }
+
+    #[test]
+    fn alignment_default_is_left() {
+        assert_eq!(Alignment::default(), Alignment::Left);
     }
 }

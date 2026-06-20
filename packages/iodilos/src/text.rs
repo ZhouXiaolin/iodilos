@@ -151,6 +151,66 @@ impl From<String> for Span {
     }
 }
 
+/// A line of text: one or more [`Span`]s, an optional line-wide style
+/// (patched onto each span during paint), and an optional alignment. Mirrors
+/// `ratatui_core::text::Line`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Line {
+    /// A style applied to every span in the line (patched under each span's own).
+    pub style: SpanStyle,
+    /// Optional alignment within the available width.
+    pub alignment: Option<Alignment>,
+    /// The spans making up this line.
+    pub spans: Vec<Span>,
+}
+
+impl Line {
+    /// A line with a single unstyled span.
+    pub fn raw<T: Into<Cow<'static, str>>>(content: T) -> Self {
+        Self {
+            spans: vec![Span::raw(content)],
+            ..Default::default()
+        }
+    }
+
+    /// A line with a single span carrying `style` (line-wide style stays unset).
+    pub fn styled<T: Into<Cow<'static, str>>>(content: T, style: SpanStyle) -> Self {
+        Self {
+            spans: vec![Span::styled(content, style)],
+            ..Default::default()
+        }
+    }
+
+    /// Unicode display width (sum of span widths).
+    pub fn width(&self) -> usize {
+        self.spans.iter().map(|s| s.width()).sum()
+    }
+}
+
+impl From<Span> for Line {
+    fn from(s: Span) -> Self {
+        Self {
+            spans: vec![s],
+            ..Default::default()
+        }
+    }
+}
+
+impl From<Vec<Span>> for Line {
+    fn from(spans: Vec<Span>) -> Self {
+        Self {
+            spans,
+            ..Default::default()
+        }
+    }
+}
+
+impl From<&'static str> for Line {
+    fn from(s: &'static str) -> Self {
+        Line::raw(s)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -225,5 +285,24 @@ mod tests {
         assert_eq!(Span::raw("abc").width(), 3);
         // CJK fullwidth chars are width 2 each.
         assert_eq!(Span::raw("你好").width(), 4);
+    }
+
+    #[test]
+    fn line_raw_is_single_unstyled_span() {
+        let l = Line::raw("hello");
+        assert_eq!(l.spans.len(), 1);
+        assert_eq!(l.style, SpanStyle::default());
+        assert_eq!(l.width(), 5);
+    }
+
+    #[test]
+    fn line_from_spans_preserves_order() {
+        let l: Line = vec![
+            Span::styled("a", SpanStyle::new()),
+            Span::raw("b"),
+        ]
+        .into();
+        assert_eq!(l.spans.len(), 2);
+        assert_eq!(l.spans[0].content, Cow::Borrowed("a"));
     }
 }

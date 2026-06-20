@@ -42,6 +42,7 @@ pub use style::{
     Style, TextStyle, Weight,
 };
 pub use view::{View, ViewNode, ViewTuiNode};
+pub use text::{Alignment, Line, Modifier, Span, SpanStyle};
 
 /// The color type, re-exported from crossterm — the single point where the
 /// choice of paint backend dictates a public type (ADR-0024 §3).

@@ -14,6 +14,9 @@
 use iodilos::text::SpanStyle;
 use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 
+use crate::inline::{body_style, InlineStyleState};
+use crate::theme::MarkdownTheme;
+
 /// A single block-level Markdown element.
 #[derive(Clone, Debug)]
 pub enum Block {
@@ -79,8 +82,15 @@ pub enum Inline {
     SoftBreak,
 }
 
-/// Parse Markdown source into a list of blocks.
+/// Parse Markdown source into a list of blocks using the default theme.
 pub fn parse(src: &str) -> Vec<Block> {
+    parse_with_theme(src, &MarkdownTheme::default())
+}
+
+/// Parse Markdown source into a list of blocks, resolving inline styles with
+/// `theme`. Exposed so the renderer (and streaming path) reuse one theme across
+/// parse and render.
+pub fn parse_with_theme(src: &str, theme: &MarkdownTheme) -> Vec<Block> {
     let mut opts = Options::empty();
     opts.insert(Options::ENABLE_TABLES);
     opts.insert(Options::ENABLE_STRIKETHROUGH);
@@ -88,7 +98,7 @@ pub fn parse(src: &str) -> Vec<Block> {
     opts.insert(Options::ENABLE_MATH);
     let parser = Parser::new_ext(src, opts);
 
-    let mut p = ParseState::default();
+    let mut p = ParseState::new(theme);
     for ev in parser {
         p.event(ev);
     }
@@ -111,14 +121,17 @@ fn paragraph_block(inlines: Vec<Inline>) -> Block {
 }
 
 /// The mutable accumulator for a single `parse` pass.
-#[derive(Default)]
-struct ParseState {
+struct ParseState<'a> {
+    /// Color theme, used to resolve inline body styles.
+    theme: &'a MarkdownTheme,
     /// Top-level finished blocks.
     top: Vec<Block>,
     /// Open containers (lists, blockquotes, tables).
     stack: Vec<Frame>,
     /// Inline accumulator for the in-progress paragraph / heading / item.
     inlines: Vec<Inline>,
+    /// Current inline style state (bold/italic/strike/link open spans).
+    inline_state: InlineStyleState,
     /// Heading level while inside a `<hN>`, else `None`.
     in_heading: Option<u8>,
     /// `Some` while inside a code block; the body is appended here.
@@ -128,7 +141,29 @@ struct ParseState {
     cell_buf: Option<String>,
 }
 
-impl ParseState {
+impl<'a> ParseState<'a> {
+    fn new(theme: &'a MarkdownTheme) -> Self {
+        Self {
+            theme,
+            top: Vec::new(),
+            stack: Vec::new(),
+            inlines: Vec::new(),
+            inline_state: InlineStyleState::default(),
+            in_heading: None,
+            code_buf: None,
+            code_lang: None,
+            cell_buf: None,
+        }
+    }
+
+    /// Number of open blockquote frames on the stack (drives blockquote styling).
+    fn blockquote_depth(&self) -> usize {
+        self.stack
+            .iter()
+            .filter(|f| matches!(f, Frame::Quote(_)))
+            .count()
+    }
+
     fn event(&mut self, ev: Event) {
         // While inside a code block, only End(CodeBlock) matters; everything
         // else is body text (cmark emits Text events for the code contents).
@@ -314,10 +349,10 @@ impl ParseState {
             Event::Rule => self.push_block(Block::Rule),
 
             // Inline accumulation.
-            Event::Text(t) => push_inline(
-                &mut self.inlines,
-                Inline::Text(t.into_string(), SpanStyle::default()),
-            ),
+            Event::Text(t) => {
+                let st = body_style(self.theme, self.blockquote_depth(), self.inline_state);
+                push_inline(&mut self.inlines, Inline::Text(t.into_string(), st));
+            }
             Event::Code(t) => push_inline(&mut self.inlines, Inline::Code(t.into_string())),
             // Both inline (`$...$`) and display (`$$...$$`) math arrive as
             // inline runs carrying the raw LaTeX source. A display math run
@@ -332,6 +367,14 @@ impl ParseState {
                 &mut self.inlines,
                 Inline::Text(t.into_string(), SpanStyle::default()),
             ),
+            Event::Start(Tag::Strong) => self.inline_state.in_strong = true,
+            Event::End(TagEnd::Strong) => self.inline_state.in_strong = false,
+            Event::Start(Tag::Emphasis) => self.inline_state.in_em = true,
+            Event::End(TagEnd::Emphasis) => self.inline_state.in_em = false,
+            Event::Start(Tag::Strikethrough) => self.inline_state.in_strike = true,
+            Event::End(TagEnd::Strikethrough) => self.inline_state.in_strike = false,
+            Event::Start(Tag::Link { .. }) => self.inline_state.in_link = true,
+            Event::End(TagEnd::Link) => self.inline_state.in_link = false,
             _ => {}
         }
     }
@@ -453,13 +496,36 @@ mod tests {
     }
 
     #[test]
-    fn merges_adjacent_text_runs() {
-        // Bold + plain text both emit Text events that should merge.
+    fn different_style_runs_do_not_merge() {
+        // Bold and plain text now carry different SpanStyles, so they stay as
+        // separate runs (the merge only coalesces equal-style adjacent runs).
         let b = blocks("**bold** and plain");
         let Block::Paragraph(inlines) = &b[0] else {
             panic!("not a paragraph");
         };
-        assert_eq!(inlines.len(), 1, "adjacent text runs merged: {inlines:?}");
+        assert_eq!(
+            inlines.len(),
+            2,
+            "bold + plain should be two runs: {inlines:?}"
+        );
+    }
+
+    #[test]
+    fn bold_and_italic_carry_style() {
+        let b = parse("**bold** and *italic*");
+        let Block::Paragraph(inlines) = &b[0] else {
+            panic!("not a paragraph");
+        };
+        let has_bold = inlines.iter().any(|i| matches!(
+            i,
+            Inline::Text(t, s) if t == "bold" && s.add_modifier.contains(iodilos::text::Modifier::BOLD)
+        ));
+        let has_italic = inlines.iter().any(|i| matches!(
+            i,
+            Inline::Text(t, s) if t == "italic" && s.add_modifier.contains(iodilos::text::Modifier::ITALIC)
+        ));
+        assert!(has_bold, "bold run styled: {inlines:?}");
+        assert!(has_italic, "italic run styled: {inlines:?}");
     }
 
     #[test]
@@ -472,10 +538,12 @@ mod tests {
         assert!(!list.ordered);
         assert_eq!(list.items.len(), 3);
         // The parent item keeps its own text ("b"), separate from the nested
-        // child ("c") — a regression guard for the shared inline buffer.
+        // child ("c") — a regression guard for the shared inline buffer. Both
+        // carry the plain body style resolved by the parser.
+        let body = body_style(&MarkdownTheme::default(), 0, InlineStyleState::default());
         assert_eq!(
             list.items[1].inlines,
-            vec![Inline::Text("b".to_string(), SpanStyle::default())]
+            vec![Inline::Text("b".to_string(), body)]
         );
         assert_eq!(list.items[1].children.len(), 1);
         let nested = list.items[1].children.first().unwrap();
@@ -485,7 +553,7 @@ mod tests {
         assert_eq!(nested_list.items.len(), 1);
         assert_eq!(
             nested_list.items[0].inlines,
-            vec![Inline::Text("c".to_string(), SpanStyle::default())]
+            vec![Inline::Text("c".to_string(), body)]
         );
     }
 

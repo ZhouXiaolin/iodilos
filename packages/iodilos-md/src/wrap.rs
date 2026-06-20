@@ -94,6 +94,11 @@ pub fn wrap_inline_runs(
     lines
 }
 
+/// Emit one whitespace/non-whitespace token into the current line, flushing to
+/// a new line (via `flush`) when it would overflow `max_w`. The explicit state
+/// threading (lines/current/current_w/started + the flush callback) mirrors
+/// leaf's `wrapping.rs` structure.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn emit_token(
     token: &mut String,
     is_ws: bool,

@@ -429,11 +429,10 @@ impl<'a> ParseState<'a> {
 fn push_inline(inlines: &mut Vec<Inline>, inline: Inline) {
     if let (Some(Inline::Text(prev, prev_style)), Inline::Text(t, st)) =
         (inlines.last_mut(), &inline)
+        && prev_style == st
     {
-        if prev_style == st {
-            prev.push_str(t);
-            return;
-        }
+        prev.push_str(t);
+        return;
     }
     inlines.push(inline);
 }

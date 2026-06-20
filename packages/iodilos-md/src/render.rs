@@ -9,7 +9,7 @@ use iodilos::text::{Line, Modifier, Span, SpanStyle};
 use unicode_width::UnicodeWidthStr;
 
 use crate::highlight::Highlighter;
-use crate::parser::{Block, Inline, List, ListItem};
+use crate::parser::{Block, Inline, List, ListItem, Table};
 use crate::theme::MarkdownTheme;
 use crate::wrap::wrap_inline_runs;
 
@@ -58,8 +58,8 @@ fn render_block(
         Block::CodeBlock { lang, code } => {
             render_code_block(lang, code, width, theme, hl, out)
         }
-        Block::Table(_)
-        | Block::Math(_) => todo!("later tasks"),
+        Block::Math(src) => render_math(src, width, theme, out),
+        Block::Table(table) => render_table(table, width, theme, out),
     }
 }
 
@@ -344,6 +344,107 @@ fn render_code_block(
     out.push(Line::from(vec![bottom_bar]));
 }
 
+fn render_math(src: &str, width: usize, theme: &MarkdownTheme, out: &mut Vec<Line>) {
+    let border = Span::styled(
+        "│",
+        SpanStyle {
+            fg: Some(theme.math_border),
+            ..SpanStyle::default()
+        },
+    );
+    let top = Span::styled(
+        "─".repeat(width.max(1)),
+        SpanStyle {
+            fg: Some(theme.math_border),
+            ..SpanStyle::default()
+        },
+    );
+    out.push(Line::from(vec![top.clone()]));
+    let style = SpanStyle {
+        fg: Some(theme.math_text),
+        ..SpanStyle::default()
+    };
+    for line in src.lines() {
+        out.push(Line::from(vec![
+            border.clone(),
+            Span::raw(" "),
+            Span::styled(line.to_string(), style),
+        ]));
+    }
+    out.push(Line::from(vec![top]));
+}
+
+fn render_table(table: &Table, _width: usize, theme: &MarkdownTheme, out: &mut Vec<Line>) {
+    use pulldown_cmark::Alignment;
+    let col_count = table
+        .headers
+        .len()
+        .max(table.rows.iter().map(|r| r.len()).max().unwrap_or(0));
+    if col_count == 0 {
+        return;
+    }
+    let mut widths = vec![0usize; col_count];
+    for (i, h) in table.headers.iter().enumerate() {
+        widths[i] = widths[i].max(display_width(h));
+    }
+    for row in &table.rows {
+        for (i, cell) in row.iter().enumerate() {
+            if i < col_count {
+                widths[i] = widths[i].max(display_width(cell));
+            }
+        }
+    }
+    let bar = Span::styled(
+        "│",
+        SpanStyle {
+            fg: Some(theme.table_border),
+            ..SpanStyle::default()
+        },
+    );
+    let header_style = SpanStyle {
+        fg: Some(theme.table_header),
+        add_modifier: Modifier::BOLD,
+        ..SpanStyle::default()
+    };
+    let push_row = |out: &mut Vec<Line>, cells: &[String], style: SpanStyle| {
+        let mut spans = vec![bar.clone()];
+        for (i, w) in widths.iter().enumerate() {
+            let content = cells.get(i).map(String::as_str).unwrap_or("");
+            let align = table.aligns.get(i).copied().unwrap_or(Alignment::Left);
+            let padded = pad_cell(content, *w, align);
+            spans.push(Span::styled(padded, style));
+            spans.push(bar.clone());
+        }
+        out.push(Line::from(spans));
+    };
+    push_row(out, &table.headers, header_style);
+    for row in &table.rows {
+        push_row(out, row, SpanStyle::default());
+    }
+}
+
+fn pad_cell(content: &str, width: usize, align: pulldown_cmark::Alignment) -> String {
+    let len = display_width(content);
+    if len >= width {
+        return content.to_string();
+    }
+    let pad = width - len;
+    match align {
+        pulldown_cmark::Alignment::Center => {
+            let l = pad / 2;
+            format!("{}{}{}", " ".repeat(l), content, " ".repeat(pad - l))
+        }
+        pulldown_cmark::Alignment::Right => format!("{}{}", " ".repeat(pad), content),
+        pulldown_cmark::Alignment::Left | pulldown_cmark::Alignment::None => {
+            format!("{}{}", content, " ".repeat(pad))
+        }
+    }
+}
+
+fn display_width(s: &str) -> usize {
+    UnicodeWidthStr::width(s)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -463,6 +564,40 @@ mod tests {
                 .any(|s| s.style.fg.is_some()),
             "some highlighted span"
         );
+    }
+
+    #[test]
+    fn math_block_renders_source_in_frame() {
+        let theme = MarkdownTheme::default();
+        let lines = render_to_lines("$$\\int_0^1 x\\,dx$$\n", 40, &theme);
+        let joined: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|s| s.content.as_ref().to_string())
+            .collect();
+        assert!(joined.contains("\\int_0^1"), "math source preserved: {joined}");
+    }
+
+    #[test]
+    fn table_renders_aligned_columns() {
+        let theme = MarkdownTheme::default();
+        let src = "| H1 | H2 |\n|----|----|\n| a  | b  |\n";
+        let lines = render_to_lines(src, 40, &theme);
+        let joined: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|s| s.content.as_ref().to_string())
+            .collect();
+        assert!(joined.contains("H1"), "header present: {joined}");
+        assert!(joined.contains('│'), "column bars: {joined}");
+    }
+
+    const SAMPLE: &str = "# H\n\npara `code`.\n\n- a\n  - b\n- c\n\n> q\n\n---\n\n```rust\nfn x() {}\n```\n\n| A | B |\n|---|---|\n| 1 | 2 |\n";
+
+    #[test]
+    fn render_sample_to_lines_does_not_panic() {
+        let theme = MarkdownTheme::default();
+        let _lines = render_to_lines(SAMPLE, 60, &theme);
     }
 
     #[test]

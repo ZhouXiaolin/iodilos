@@ -49,9 +49,11 @@ fn render_block(
         Block::Paragraph(inlines) => {
             render_paragraph(inlines, width, theme, blockquote_depth, out)
         }
+        Block::BlockQuote(blocks) => {
+            render_blockquote(blocks, width, theme, hl, blockquote_depth, out)
+        }
         Block::CodeBlock { .. }
         | Block::List(_)
-        | Block::BlockQuote(_)
         | Block::Table(_)
         | Block::Math(_) => todo!("later tasks"),
     }
@@ -166,6 +168,40 @@ fn inline_runs(inlines: &[Inline], theme: &MarkdownTheme, blockquote_depth: usiz
     spans
 }
 
+fn render_blockquote(
+    blocks: &[Block],
+    width: usize,
+    theme: &MarkdownTheme,
+    hl: &Highlighter,
+    blockquote_depth: usize,
+    out: &mut Vec<Line>,
+) {
+    let depth = blockquote_depth + 1;
+    let bar = Span::styled(
+        "▏ ",
+        SpanStyle {
+            fg: Some(theme.blockquote_marker),
+            ..SpanStyle::default()
+        },
+    );
+    let prefix = vec![bar];
+    // Render inner blocks into a temp buffer, then prepend the bar to each line.
+    let mut inner = Vec::new();
+    let mut first = true;
+    for block in blocks {
+        if !first {
+            inner.push(Line::raw(""));
+        }
+        first = false;
+        render_block(block, width.saturating_sub(2), theme, hl, depth, &mut inner);
+    }
+    for mut line in inner {
+        let mut spans = prefix.clone();
+        spans.append(&mut line.spans);
+        out.push(Line::from(spans));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -221,6 +257,20 @@ mod tests {
             .expect("bold span");
         assert_eq!(bold_span.style.fg, Some(theme.strong_text));
         assert!(bold_span.style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn blockquote_draws_bar_prefix() {
+        let theme = MarkdownTheme::default();
+        let lines = render_to_lines("> quoted text here", 40, &theme);
+        // First non-empty line carries the blockquote bar span.
+        let l = lines.iter().find(|l| !l.spans.is_empty()).expect("a line");
+        let first_span = &l.spans[0];
+        assert!(
+            first_span.content.as_ref().contains('▏'),
+            "expected blockquote bar, got {:?}",
+            first_span.content
+        );
     }
 
     #[test]

@@ -2,8 +2,8 @@
 //!
 //! Replaces the previous ratatui `Buffer`. A [`Canvas`] is a grid of
 //! [`CanvasCell`], each holding an optional [`Character`] with a
-//! [`CanvasTextStyle`] and an optional `background_color` of type
-//! `crossterm::style::Color`. Cell widths are measured with `unicode-width`.
+//! [`SpanStyle`](crate::text::SpanStyle) and an optional `background_color` of
+//! type `crossterm::style::Color`. Cell widths are measured with `unicode-width`.
 //!
 //! Painting (layout output) writes into a `Canvas`; the render driver diffs
 //! the current `Canvas` against the previous frame's `Canvas` and emits the
@@ -17,36 +17,11 @@ use crossterm::csi;
 use crossterm::style::{Attribute, Color, SetBackgroundColor, SetForegroundColor};
 use unicode_width::UnicodeWidthChar;
 
-use crate::style::Weight;
+use crate::text::{Modifier, SpanStyle};
 
 /// Re-export of `crossterm::style::Color` — the in-memory color type, so there
 /// is no conversion at the paint boundary.
 pub use crossterm::style::Color as CrosstermColor;
-
-/// Describes the style of text rendered via a [`Canvas`]. The fields mirror the
-/// inheritable text-paint properties (`color`, `weight`, `decoration`,
-/// `italic`, `invert`) from ADR-0024 §6.
-#[non_exhaustive]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct CanvasTextStyle {
-    /// The text color.
-    pub color: Option<Color>,
-    /// The text weight.
-    pub weight: Weight,
-    /// Whether the text is underlined.
-    pub underline: bool,
-    /// Whether the text is italicized.
-    pub italic: bool,
-    /// Whether the text is rendered with reversed foreground/background.
-    pub invert: bool,
-}
-
-impl CanvasTextStyle {
-    /// Whether the style carries any attribute that needs an SGR escape.
-    fn has_attrs(self) -> bool {
-        self.weight != Weight::Normal || self.underline || self.italic || self.invert
-    }
-}
 
 /// A single grapheme cluster plus the style it was painted with.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -54,7 +29,7 @@ pub struct Character {
     /// The character's string value (a single grapheme, possibly multi-code-point).
     pub value: String,
     /// The style applied to the character.
-    pub style: CanvasTextStyle,
+    pub style: SpanStyle,
 }
 
 impl Character {
@@ -172,9 +147,8 @@ impl Canvas {
     }
 
     /// Apply a text style across the given rect without writing characters.
-    /// Used so a container's text-paint defaults apply to empty cells.
-    pub fn set_style(&mut self, rect: Rect, style: CanvasTextStyle) {
-        if style.color.is_none() && !style.has_attrs() {
+    pub fn set_style(&mut self, rect: Rect, style: SpanStyle) {
+        if style == SpanStyle::default() {
             return;
         }
         for y in rect.y..rect.bottom() {
@@ -183,7 +157,7 @@ impl Canvas {
                     if let Some(cell) = row.get_mut(x as usize)
                         && let Some(character) = cell.character.as_mut()
                     {
-                        character.style = merge_style(character.style, style);
+                        character.style = character.style.patch(style);
                     }
                 }
             }
@@ -206,7 +180,7 @@ impl Canvas {
     /// Write `text` into the canvas starting at `(rect.x, rect.y)`, wrapping at
     /// `rect.width` and clipping to `rect.height` rows. Each grapheme keeps its
     /// `width` cells (wide characters occupy two cells, the second left blank).
-    pub fn set_text(&mut self, rect: Rect, text: &str, style: CanvasTextStyle) {
+    pub fn set_text(&mut self, rect: Rect, text: &str, style: SpanStyle) {
         if rect.width == 0 || rect.height == 0 {
             return;
         }
@@ -238,7 +212,7 @@ impl Canvas {
 
     /// Place a single character at `(x0 + col, y)`. Wide characters blank the
     /// following cell.
-    fn place_char(&mut self, x0: u16, y: u16, col: usize, ch: char, cw: usize, style: CanvasTextStyle) {
+    fn place_char(&mut self, x0: u16, y: u16, col: usize, ch: char, cw: usize, style: SpanStyle) {
         let abs_x = x0 as usize + col;
         let row = match self.cells.get_mut(y as usize) {
             Some(row) => row,
@@ -261,7 +235,7 @@ impl Canvas {
     /// each row to column 0. Used for the initial full paint.
     pub fn write_ansi<W: Write>(&self, w: &mut W) -> io::Result<()> {
         let mut background = None;
-        let mut text_style = CanvasTextStyle::default();
+        let mut text_style = SpanStyle::default();
         write!(w, csi!("0m"))?;
         for y in 0..self.height() {
             queue_move_to(w, 0, y as u16)?;
@@ -310,51 +284,46 @@ fn emit_cell<W: Write>(
     w: &mut W,
     cell: &CanvasCell,
     background: &mut Option<Color>,
-    text_style: &mut CanvasTextStyle,
+    text_style: &mut SpanStyle,
 ) -> io::Result<()> {
-    // Reset when an attribute is being turned off, so SGR deltas stay correct.
-    let mut needs_reset = false;
-    if let Some(c) = &cell.character {
-        if c.style.weight != text_style.weight && c.style.weight == Weight::Normal {
-            needs_reset = true;
-        }
-        if !c.style.underline && text_style.underline {
-            needs_reset = true;
-        }
-        if !c.style.italic && text_style.italic {
-            needs_reset = true;
-        }
-        if !c.style.invert && text_style.invert {
-            needs_reset = true;
-        }
-    } else if text_style.underline || text_style.invert {
-        needs_reset = true;
-    }
+    let needs_reset = match &cell.character {
+        Some(c) => !c.style.sub_modifier.is_empty()
+            || (c.style.fg.is_none() && text_style.fg.is_some())
+            || (c.style.bg.is_none() && text_style.bg.is_some())
+            || (c.style.underline_color.is_none() && text_style.underline_color.is_some())
+            || (c.style.add_modifier & !text_style.add_modifier).is_empty()
+                && !text_style.add_modifier.is_empty()
+                && c.style.add_modifier != text_style.add_modifier,
+        None => !text_style.add_modifier.is_empty()
+            || text_style.fg.is_some()
+            || text_style.bg.is_some()
+            || text_style.underline_color.is_some(),
+    };
     if needs_reset {
         write!(w, csi!("0m"))?;
         *background = None;
-        *text_style = CanvasTextStyle::default();
+        *text_style = SpanStyle::default();
     }
 
     if let Some(c) = &cell.character {
-        if c.style.color != text_style.color {
-            write!(w, "{}", SetForegroundColor(c.style.color.unwrap_or(Color::Reset)))?;
+        if c.style.fg != text_style.fg {
+            write!(
+                w,
+                "{}",
+                SetForegroundColor(c.style.fg.unwrap_or(Color::Reset))
+            )?;
         }
-        if c.style.weight != text_style.weight {
-            match c.style.weight {
-                Weight::Bold => write!(w, csi!("{}m"), Attribute::Bold.sgr())?,
-                Weight::Normal => {}
-                Weight::Light => write!(w, csi!("{}m"), Attribute::Dim.sgr())?,
-            }
+        if c.style.bg != text_style.bg {
+            write!(
+                w,
+                "{}",
+                SetBackgroundColor(c.style.bg.unwrap_or(Color::Reset))
+            )?;
         }
-        if c.style.underline && !text_style.underline {
-            write!(w, csi!("{}m"), Attribute::Underlined.sgr())?;
-        }
-        if c.style.italic && !text_style.italic {
-            write!(w, csi!("{}m"), Attribute::Italic.sgr())?;
-        }
-        if c.style.invert && !text_style.invert {
-            write!(w, csi!("{}m"), Attribute::Reverse.sgr())?;
+        // Only add modifiers that turned on relative to the running style.
+        let newly_on = c.style.add_modifier & !text_style.add_modifier;
+        for attr in modifier_attributes(newly_on) {
+            write!(w, csi!("{}m"), attr.sgr())?;
         }
         *text_style = c.style;
     }
@@ -376,19 +345,26 @@ fn emit_cell<W: Write>(
     Ok(())
 }
 
-/// Combine a base style with an overlay: overlay fields win where set.
-fn merge_style(base: CanvasTextStyle, overlay: CanvasTextStyle) -> CanvasTextStyle {
-    CanvasTextStyle {
-        color: overlay.color.or(base.color),
-        weight: if overlay.weight != Weight::Normal {
-            overlay.weight
-        } else {
-            base.weight
-        },
-        underline: overlay.underline || base.underline,
-        italic: overlay.italic || base.italic,
-        invert: overlay.invert || base.invert,
+/// Map each set `Modifier` bit to its crossterm `Attribute`.
+pub(crate) fn modifier_attributes(m: Modifier) -> Vec<Attribute> {
+    let mut out = Vec::new();
+    let pairs = [
+        (Modifier::BOLD, Attribute::Bold),
+        (Modifier::DIM, Attribute::Dim),
+        (Modifier::ITALIC, Attribute::Italic),
+        (Modifier::UNDERLINED, Attribute::Underlined),
+        (Modifier::SLOW_BLINK, Attribute::SlowBlink),
+        (Modifier::RAPID_BLINK, Attribute::RapidBlink),
+        (Modifier::REVERSED, Attribute::Reverse),
+        (Modifier::HIDDEN, Attribute::Hidden),
+        (Modifier::CROSSED_OUT, Attribute::CrossedOut),
+    ];
+    for (flag, attr) in pairs {
+        if m.contains(flag) {
+            out.push(attr);
+        }
     }
+    out
 }
 
 #[cfg(test)]
@@ -406,7 +382,7 @@ mod tests {
     #[test]
     fn set_text_writes_and_wraps() {
         let mut canvas = Canvas::empty(Rect::new(0, 0, 3, 2));
-        canvas.set_text(Rect::new(0, 0, 3, 2), "abcd", CanvasTextStyle::default());
+        canvas.set_text(Rect::new(0, 0, 3, 2), "abcd", SpanStyle::default());
         // 'a','b','c' on row 0; 'd' wraps to row 1.
         assert_eq!(canvas.cell(0, 0).unwrap().character.as_ref().unwrap().value, "a");
         assert_eq!(canvas.cell(2, 0).unwrap().character.as_ref().unwrap().value, "c");
@@ -421,10 +397,10 @@ mod tests {
         canvas.set_text(
             Rect::new(0, 0, 2, 1),
             "ab",
-            CanvasTextStyle {
-                color: Some(Color::Red),
-                weight: Weight::Bold,
-                ..CanvasTextStyle::default()
+            crate::text::SpanStyle {
+                fg: Some(Color::Red),
+                add_modifier: crate::text::Modifier::BOLD,
+                ..crate::text::SpanStyle::default()
             },
         );
         let mut out = Vec::new();
@@ -434,5 +410,27 @@ mod tests {
         // crossterm emits red foreground as a 256-color sequence (`38;5;9`).
         assert!(s.contains("38;5;9m"), "should set red fg: {s}");
         assert!(s.contains("[1m"), "should set bold: {s}");
+    }
+
+    #[test]
+    fn set_text_with_spanstyle_emits_bg_and_crossed_out() {
+        crossterm::style::force_color_output(true);
+        let mut canvas = Canvas::empty(Rect::new(0, 0, 2, 1));
+        canvas.set_text(
+            Rect::new(0, 0, 2, 1),
+            "ab",
+            crate::text::SpanStyle {
+                bg: Some(Color::Blue),
+                add_modifier: crate::text::Modifier::CROSSED_OUT,
+                ..crate::text::SpanStyle::default()
+            },
+        );
+        let mut out = Vec::new();
+        canvas.write_ansi(&mut out).unwrap();
+        let s = String::from_utf8_lossy(&out);
+        // crossterm 256-color blue background is `48;5;12`.
+        assert!(s.contains("48;5;12m"), "should set blue bg: {s}");
+        // crossed-out SGR is 9.
+        assert!(s.contains("[9m"), "should set crossed-out: {s}");
     }
 }

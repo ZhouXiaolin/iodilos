@@ -284,7 +284,7 @@ impl RenderState {
 /// ADR-0024 §12 over the self-built `Canvas` rather than a ratatui `Buffer`.
 fn diff_and_draw<W: Write>(w: &mut W, prev: &Canvas, next: &Canvas) -> io::Result<()> {
     use crossterm::csi;
-    use crossterm::style::{Attribute, Color, SetBackgroundColor, SetForegroundColor};
+    use crossterm::style::{Color, SetBackgroundColor, SetForegroundColor};
 
     if prev.size() != next.size() {
         write!(w, csi!("2J"))?;
@@ -294,7 +294,7 @@ fn diff_and_draw<W: Write>(w: &mut W, prev: &Canvas, next: &Canvas) -> io::Resul
     let width = next.width();
     let height = next.height();
     let mut background = None;
-    let mut text_style = crate::canvas::CanvasTextStyle::default();
+    let mut text_style = crate::text::SpanStyle::default();
 
     for y in 0..height {
         for x in 0..width {
@@ -307,34 +307,27 @@ fn diff_and_draw<W: Write>(w: &mut W, prev: &Canvas, next: &Canvas) -> io::Resul
             // Position the cursor explicitly at this cell.
             write!(w, csi!("{};{}H"), y + 1, x + 1)?;
             if let Some(ch) = &cell.character {
-                let needs_reset = (ch.style.weight != text_style.weight
-                    && ch.style.weight == crate::style::Weight::Normal)
-                    || (!ch.style.underline && text_style.underline)
-                    || (!ch.style.italic && text_style.italic)
-                    || (!ch.style.invert && text_style.invert);
+                let needs_reset = !ch.style.sub_modifier.is_empty()
+                    || (ch.style.fg.is_none() && text_style.fg.is_some())
+                    || (ch.style.bg.is_none() && text_style.bg.is_some())
+                    || (ch.style.underline_color.is_none() && text_style.underline_color.is_some())
+                    || (ch.style.add_modifier & !text_style.add_modifier).is_empty()
+                        && !text_style.add_modifier.is_empty()
+                        && ch.style.add_modifier != text_style.add_modifier;
                 if needs_reset {
                     write!(w, csi!("0m"))?;
                     background = None;
-                    text_style = crate::canvas::CanvasTextStyle::default();
+                    text_style = crate::text::SpanStyle::default();
                 }
-                if ch.style.color != text_style.color {
-                    write!(w, "{}", SetForegroundColor(ch.style.color.unwrap_or(Color::Reset)))?;
+                if ch.style.fg != text_style.fg {
+                    write!(w, "{}", SetForegroundColor(ch.style.fg.unwrap_or(Color::Reset)))?;
                 }
-                if ch.style.weight != text_style.weight {
-                    match ch.style.weight {
-                        crate::style::Weight::Bold => write!(w, csi!("{}m"), Attribute::Bold.sgr())?,
-                        crate::style::Weight::Normal => {}
-                        crate::style::Weight::Light => write!(w, csi!("{}m"), Attribute::Dim.sgr())?,
-                    }
+                if ch.style.bg != text_style.bg {
+                    write!(w, "{}", SetBackgroundColor(ch.style.bg.unwrap_or(Color::Reset)))?;
                 }
-                if ch.style.underline && !text_style.underline {
-                    write!(w, csi!("{}m"), Attribute::Underlined.sgr())?;
-                }
-                if ch.style.italic && !text_style.italic {
-                    write!(w, csi!("{}m"), Attribute::Italic.sgr())?;
-                }
-                if ch.style.invert && !text_style.invert {
-                    write!(w, csi!("{}m"), Attribute::Reverse.sgr())?;
+                let newly_on = ch.style.add_modifier & !text_style.add_modifier;
+                for attr in crate::canvas::modifier_attributes(newly_on) {
+                    write!(w, csi!("{}m"), attr.sgr())?;
                 }
                 text_style = ch.style;
             }
@@ -584,7 +577,8 @@ mod tests {
 
     use super::*;
     use crate::attributes::{GlobalAttributes, GlobalAttributesExt};
-    use crate::canvas::{Canvas, CanvasTextStyle, Rect};
+    use crate::canvas::{Canvas, Rect};
+    use crate::text::SpanStyle;
     use crate::components::tags;
     use crate::layout::render as render_buffer;
     use crate::view::View;
@@ -789,9 +783,9 @@ mod tests {
     fn diff_does_not_inherit_style_from_skipped_unchanged_cells() {
         crossterm::style::force_color_output(true);
 
-        let red = CanvasTextStyle {
-            color: Some(Color::Red),
-            ..CanvasTextStyle::default()
+        let red = SpanStyle {
+            fg: Some(Color::Red),
+            ..SpanStyle::default()
         };
         let mut prev = Canvas::empty(Rect::new(0, 0, 2, 1));
         prev.set_text(Rect::new(0, 0, 1, 1), "a", red);

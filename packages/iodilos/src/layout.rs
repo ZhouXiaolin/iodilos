@@ -13,9 +13,10 @@ use taffy::{NodeId as TaffyNodeId, TaffyTree};
 use unicode_width::UnicodeWidthStr;
 
 use crate::attributes::resolve_style;
-use crate::canvas::{Canvas, CanvasTextStyle, Rect};
+use crate::canvas::{Canvas, Rect};
 use crate::node::{NodeId, TuiNode};
 use crate::style::{Edges, Style, TextStyle};
+use crate::text::SpanStyle;
 
 #[derive(Debug, Clone)]
 pub(crate) struct RuntimeNode {
@@ -104,11 +105,78 @@ struct Measure {
 #[derive(Debug)]
 struct PaintNode {
     tag: Option<String>,
-    rect: Rect,
+    rect: PaintRect,
     text: String,
     style: Style,
     text_leaf: bool,
     children: Vec<PaintNode>,
+}
+
+/// A rectangle in terminal-cell space, used inside the paint pipeline. Unlike
+/// the public [`Rect`] (whose coordinates are `u16`), positions here are
+/// `i32` so a node may sit at a negative coordinate — this is what makes
+/// scrolling work: an in-flow child of an `overflow: hidden` viewport is
+/// translated up by a negative `margin_top`, landing above the viewport's
+/// origin, and the paint pipeline clips the off-screen portion. Width/height
+/// stay `u16` (sizes are never negative).
+///
+/// The previous implementation clamped positions to `>= 0` in `rect_from_layout`
+/// (because `Rect` is `u16`), which silently pinned any scrolled content to the
+/// top of its viewport — `margin_top = -10` painted as if it were `0`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct PaintRect {
+    x: i32,
+    y: i32,
+    width: u16,
+    height: u16,
+}
+
+impl PaintRect {
+    const ZERO: PaintRect = PaintRect {
+        x: 0,
+        y: 0,
+        width: 0,
+        height: 0,
+    };
+
+    fn new(x: i32, y: i32, width: u16, height: u16) -> Self {
+        Self {
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+
+    /// Exclusive right edge, saturating at `i32::MAX`.
+    fn right(self) -> i32 {
+        self.x.saturating_add(self.width as i32)
+    }
+
+    /// Exclusive bottom edge, saturating at `i32::MAX`.
+    fn bottom(self) -> i32 {
+        self.y.saturating_add(self.height as i32)
+    }
+
+    /// Convert to the public [`Rect`], clamping positions into the `u16`
+    /// range. Used only when handing a paint rect to canvas cell-writing
+    /// methods (which take `u16` coords) — by then the paint pipeline has
+    /// already clipped, so any still-negative position is genuinely off-screen
+    /// and the clamp is a no-op for visible cells.
+    fn to_canvas_rect(self) -> Rect {
+        Rect::new(
+            self.x.clamp(0, u16::MAX as i32) as u16,
+            self.y.clamp(0, u16::MAX as i32) as u16,
+            self.width,
+            self.height,
+        )
+    }
+}
+
+impl From<Rect> for PaintRect {
+    fn from(rect: Rect) -> Self {
+        PaintRect::new(rect.x as i32, rect.y as i32, rect.width, rect.height)
+    }
 }
 
 /// Lay out `nodes` into `area` and paint the result into a fresh [`Canvas`].
@@ -155,16 +223,17 @@ pub(crate) fn render(
     );
 
     let mut index = RuntimeIndex::default();
+    let area_paint: PaintRect = area.into();
     let paint_nodes = built_roots
         .iter()
-        .map(|built| extract_node(&taffy, built, area, &mut index))
+        .map(|built| extract_node(&taffy, built, area_paint, &mut index))
         .collect::<Vec<_>>();
 
     let mut canvas = Canvas::empty(area);
     // Text paint inherits from the root; layout/border/background do not.
     let root_text = TextStyle::default();
     for node in &paint_nodes {
-        paint_node(&mut canvas, node, root_text, area, area);
+        paint_node(&mut canvas, node, root_text, area_paint, area_paint);
     }
 
     (canvas, index)
@@ -297,16 +366,19 @@ fn build_node(
 fn extract_node(
     tree: &TaffyTree<Measure>,
     built: &BuiltNode,
-    parent_rect: Rect,
+    parent_rect: PaintRect,
     index: &mut RuntimeIndex,
 ) -> PaintNode {
     let layout = tree.layout(built.taffy_id).expect("taffy layout");
     let rect = rect_from_layout(layout, parent_rect);
+    // The runtime index (hit testing, focus) only cares about on-screen
+    // elements, so it stores the public u16 Rect clamped to the screen — a
+    // node scrolled above the viewport is not clickable.
     index.nodes.insert(
         built.runtime_id,
         RuntimeNode {
             parent: built.parent,
-            rect,
+            rect: rect.to_canvas_rect(),
             tag: built.tag.clone(),
         },
     );
@@ -342,7 +414,13 @@ fn extract_node(
 /// `draw_tree`). A zero-size node (e.g. a transparent `Dynamic` container that
 /// collapsed because its only child is out-of-flow) still recurses into its
 /// children; it just draws nothing of its own.
-fn paint_node(canvas: &mut Canvas, node: &PaintNode, parent_text: TextStyle, clip: Rect, screen: Rect) {
+fn paint_node(
+    canvas: &mut Canvas,
+    node: &PaintNode,
+    parent_text: TextStyle,
+    clip: PaintRect,
+    screen: PaintRect,
+) {
     let has_size = node.rect.width != 0 && node.rect.height != 0;
 
     // Resolve the inheritable text style: this node's text-paint fields inherit
@@ -358,15 +436,16 @@ fn paint_node(canvas: &mut Canvas, node: &PaintNode, parent_text: TextStyle, cli
             // Mirrors iocraft's `View::draw`, which `clear_text`s before
             // `set_background_color`. This node's own border/text are drawn
             // afterwards and so still show on top.
-            canvas.clear_text(rect);
-            canvas.set_background_color(rect, bg);
+            let canvas_rect = rect.to_canvas_rect();
+            canvas.clear_text(canvas_rect);
+            canvas.set_background_color(canvas_rect, bg);
         }
 
         if let Some(border_chars) = node.style.border_style.border_characters() {
             // The border uses only its own color, not inherited text paint.
-            let border_style = CanvasTextStyle {
-                color: node.style.border_color,
-                ..CanvasTextStyle::default()
+            let border_style = SpanStyle {
+                fg: node.style.border_color,
+                ..SpanStyle::default()
             };
             paint_border_clipped(
                 canvas,
@@ -381,14 +460,15 @@ fn paint_node(canvas: &mut Canvas, node: &PaintNode, parent_text: TextStyle, cli
         // Only leaf/inline tags emit text; containers delegate to their children.
         if node.text_leaf {
             let display_text = display_text_for_tag(node.tag.as_deref(), &node.text);
-            paint_text_clipped(canvas, node.rect, &display_text, text, clip);
+            let span_style = SpanStyle::from(text);
+            paint_text_clipped(canvas, node.rect, &display_text, span_style, clip);
         }
     }
 
     let child_clip = if node.style.overflow == taffy::style::Overflow::Visible {
         clip
     } else {
-        intersect_rect(clip, content_rect(node)).unwrap_or(Rect::new(0, 0, 0, 0))
+        intersect_rect(clip, content_rect(node)).unwrap_or(PaintRect::ZERO)
     };
     for child in &node.children {
         // An absolutely-positioned child lives in its containing block, not this
@@ -404,18 +484,18 @@ fn paint_node(canvas: &mut Canvas, node: &PaintNode, parent_text: TextStyle, cli
 
 fn paint_border_clipped(
     canvas: &mut Canvas,
-    rect: Rect,
+    rect: PaintRect,
     chars: crate::style::BorderCharacters,
     edges: Option<Edges>,
-    style: CanvasTextStyle,
-    clip: Rect,
+    style: SpanStyle,
+    clip: PaintRect,
 ) {
     let edges = edges.unwrap_or(Edges::all());
     if rect.width < 2 || rect.height < 2 {
         return;
     }
-    let right = rect.x + rect.width - 1;
-    let bottom = rect.y + rect.height - 1;
+    let right = rect.x + (rect.width as i32) - 1;
+    let bottom = rect.y + (rect.height as i32) - 1;
 
     if edges.contains(Edges::TOP) {
         let left_border_size = u16::from(edges.contains(Edges::LEFT));
@@ -423,7 +503,7 @@ fn paint_border_clipped(
         if edges.contains(Edges::LEFT) {
             paint_text_clipped_raw(
                 canvas,
-                Rect::new(rect.x, rect.y, 1, 1),
+                PaintRect::new(rect.x, rect.y, 1, 1),
                 &chars.top_left.to_string(),
                 style,
                 clip,
@@ -435,7 +515,7 @@ fn paint_border_clipped(
             .saturating_sub(right_border_size);
         paint_text_clipped_raw(
             canvas,
-            Rect::new(rect.x + left_border_size, rect.y, width, 1),
+            PaintRect::new(rect.x + (left_border_size as i32), rect.y, width, 1),
             &chars.top.to_string().repeat(width as usize),
             style,
             clip,
@@ -443,7 +523,7 @@ fn paint_border_clipped(
         if edges.contains(Edges::RIGHT) {
             paint_text_clipped_raw(
                 canvas,
-                Rect::new(right, rect.y, 1, 1),
+                PaintRect::new(right, rect.y, 1, 1),
                 &chars.top_right.to_string(),
                 style,
                 clip,
@@ -454,7 +534,7 @@ fn paint_border_clipped(
         if edges.contains(Edges::LEFT) {
             paint_text_clipped_raw(
                 canvas,
-                Rect::new(rect.x, y, 1, 1),
+                PaintRect::new(rect.x, y, 1, 1),
                 &chars.left.to_string(),
                 style,
                 clip,
@@ -463,7 +543,7 @@ fn paint_border_clipped(
         if edges.contains(Edges::RIGHT) {
             paint_text_clipped_raw(
                 canvas,
-                Rect::new(right, y, 1, 1),
+                PaintRect::new(right, y, 1, 1),
                 &chars.right.to_string(),
                 style,
                 clip,
@@ -476,7 +556,7 @@ fn paint_border_clipped(
         if edges.contains(Edges::LEFT) {
             paint_text_clipped_raw(
                 canvas,
-                Rect::new(rect.x, bottom, 1, 1),
+                PaintRect::new(rect.x, bottom, 1, 1),
                 &chars.bottom_left.to_string(),
                 style,
                 clip,
@@ -488,7 +568,7 @@ fn paint_border_clipped(
             .saturating_sub(right_border_size);
         paint_text_clipped_raw(
             canvas,
-            Rect::new(rect.x + left_border_size, bottom, width, 1),
+            PaintRect::new(rect.x + (left_border_size as i32), bottom, width, 1),
             &chars.bottom.to_string().repeat(width as usize),
             style,
             clip,
@@ -496,7 +576,7 @@ fn paint_border_clipped(
         if edges.contains(Edges::RIGHT) {
             paint_text_clipped_raw(
                 canvas,
-                Rect::new(right, bottom, 1, 1),
+                PaintRect::new(right, bottom, 1, 1),
                 &chars.bottom_right.to_string(),
                 style,
                 clip,
@@ -505,16 +585,22 @@ fn paint_border_clipped(
     }
 }
 
-fn paint_text_clipped(canvas: &mut Canvas, rect: Rect, text: &str, style: TextStyle, clip: Rect) {
-    paint_text_clipped_raw(canvas, rect, text, to_canvas_style(style), clip);
+fn paint_text_clipped(
+    canvas: &mut Canvas,
+    rect: PaintRect,
+    text: &str,
+    style: SpanStyle,
+    clip: PaintRect,
+) {
+    paint_text_clipped_raw(canvas, rect, text, style, clip);
 }
 
 fn paint_text_clipped_raw(
     canvas: &mut Canvas,
-    rect: Rect,
+    rect: PaintRect,
     text: &str,
-    style: CanvasTextStyle,
-    clip: Rect,
+    style: SpanStyle,
+    clip: PaintRect,
 ) {
     if text.is_empty() || rect.width == 0 || rect.height == 0 {
         return;
@@ -541,15 +627,21 @@ fn paint_text_clipped_raw(
                 return;
             }
         }
-        let x = rect.x.saturating_add(col as u16);
-        if contains_point(clip, x, y) {
-            canvas.set_text(Rect::new(x, y, cw as u16, 1), &ch.to_string(), style);
+        let x = rect.x + (col as i32);
+        if contains_point_i32(clip, x, y) {
+            // `contains_point_i32` against a screen-space clip guarantees x,y >= 0,
+            // but clamp defensively so a stray negative can never wrap into a huge u16.
+            canvas.set_text(
+                Rect::new(x.max(0) as u16, y.max(0) as u16, cw as u16, 1),
+                &ch.to_string(),
+                style,
+            );
         }
         col += cw;
     }
 }
 
-fn content_rect(node: &PaintNode) -> Rect {
+fn content_rect(node: &PaintNode) -> PaintRect {
     if node.style.border_style.is_none() {
         return node.rect;
     }
@@ -558,20 +650,27 @@ fn content_rect(node: &PaintNode) -> Rect {
     let right = u16::from(edges.contains(Edges::RIGHT));
     let top = u16::from(edges.contains(Edges::TOP));
     let bottom = u16::from(edges.contains(Edges::BOTTOM));
-    Rect::new(
-        node.rect.x.saturating_add(left),
-        node.rect.y.saturating_add(top),
+    PaintRect::new(
+        node.rect.x + (left as i32),
+        node.rect.y + (top as i32),
         node.rect.width.saturating_sub(left).saturating_sub(right),
         node.rect.height.saturating_sub(top).saturating_sub(bottom),
     )
 }
 
-fn intersect_rect(a: Rect, b: Rect) -> Option<Rect> {
+fn intersect_rect(a: PaintRect, b: PaintRect) -> Option<PaintRect> {
     let x = a.x.max(b.x);
     let y = a.y.max(b.y);
     let right = a.right().min(b.right());
     let bottom = a.bottom().min(b.bottom());
-    (x < right && y < bottom).then(|| Rect::new(x, y, right - x, bottom - y))
+    (x < right && y < bottom).then(|| {
+        PaintRect::new(
+            x,
+            y,
+            (right - x).clamp(0, u16::MAX as i32) as u16,
+            (bottom - y).clamp(0, u16::MAX as i32) as u16,
+        )
+    })
 }
 
 fn measure_text(
@@ -599,12 +698,12 @@ fn measure_text(
     Size { width, height }
 }
 
-fn rect_from_layout(layout: &taffy::Layout, parent_rect: Rect) -> Rect {
+fn rect_from_layout(layout: &taffy::Layout, parent_rect: PaintRect) -> PaintRect {
     let x = parent_rect.x as f32 + layout.location.x;
     let y = parent_rect.y as f32 + layout.location.y;
-    Rect::new(
-        x.round().max(0.0) as u16,
-        y.round().max(0.0) as u16,
+    PaintRect::new(
+        x.round() as i32,
+        y.round() as i32,
         layout.size.width.round().max(0.0) as u16,
         layout.size.height.round().max(0.0) as u16,
     )
@@ -669,15 +768,12 @@ fn contains_point(rect: Rect, x: u16, y: u16) -> bool {
     x >= rect.x && x < rect.right() && y >= rect.y && y < rect.bottom()
 }
 
-/// Convert a [`TextStyle`] to the canvas paint style.
-fn to_canvas_style(text: TextStyle) -> CanvasTextStyle {
-    CanvasTextStyle {
-        color: text.color,
-        weight: text.weight,
-        underline: text.underline,
-        italic: text.italic,
-        invert: text.invert,
-    }
+/// Paint-pipeline variant of [`contains_point`]: the clip rect and the candidate
+/// coordinates may be negative (a node scrolled above the viewport's origin), so
+/// the test runs in `i32`. A point with `x < 0` or `y < 0` is off the left/top
+/// edge of the terminal and never visible.
+fn contains_point_i32(rect: PaintRect, x: i32, y: i32) -> bool {
+    x >= rect.x && x < rect.right() && y >= rect.y && y < rect.bottom()
 }
 
 #[cfg(test)]
@@ -766,14 +862,14 @@ mod tests {
         let mut canvas = Canvas::empty(Rect::new(0, 0, 6, 2));
         paint_border_clipped(
             &mut canvas,
-            Rect::new(0, 0, 6, 2),
+            Rect::new(0, 0, 6, 2).into(),
             BorderCharacters {
                 top: '▁',
                 ..Default::default()
             },
             Some(Edges::TOP),
-            CanvasTextStyle::default(),
-            Rect::new(0, 0, 6, 2),
+            SpanStyle::default(),
+            Rect::new(0, 0, 6, 2).into(),
         );
 
         let painted = canvas_to_plain_text(&canvas);
@@ -816,6 +912,58 @@ mod tests {
         root.dispose();
     }
 
+    /// Regression for in-flow scrolling: an `overflow: hidden` viewport with an
+    /// in-flow child translated up by a negative `margin_top` must show the
+    /// child's TAIL (it scrolled up) and clip its head. Before the `PaintRect`
+    /// change, `rect_from_layout` clamped the child's negative y to 0, so the
+    /// content stayed pinned to the top and never scrolled — the markdown
+    /// example's follow-the-tail appeared frozen at the first line.
+    #[test]
+    fn negative_margin_scrolls_in_flow_child_within_overflow_hidden() {
+        let mut nodes = Vec::new();
+
+        let root = create_root(|| {
+            // Viewport: 12 wide, 4 tall, bordered (content box is 2 rows).
+            // Child has 5 lines and a -3 top margin → lines 0,1,2 scroll above
+            // the viewport; lines 3,4 should be visible inside the box.
+            let view: View = tags::div()
+                .width(12)
+                .height(4)
+                .border_style(BorderStyle::Single)
+                .overflow(taffy::style::Overflow::Hidden)
+                .children(
+                    tags::div()
+                        .margin_top(-3)
+                        .children(tags::p().children("line 0\nline 1\nline 2\nline 3\nline 4")),
+                )
+                .into();
+            nodes = view.nodes.into_iter().collect();
+        });
+
+        let (canvas, _index) = render(&nodes, Rect::new(0, 0, 20, 8), None);
+        let painted = canvas_to_plain_text(&canvas);
+
+        // The tail scrolled into view.
+        assert!(
+            painted.contains("line 3"),
+            "scrolled tail (line 3) should be visible: {painted}"
+        );
+        assert!(
+            painted.contains("line 4"),
+            "scrolled tail (line 4) should be visible: {painted}"
+        );
+        // The head scrolled out and must be clipped by the viewport.
+        assert!(
+            !painted.contains("line 0"),
+            "scrolled-off head (line 0) should be clipped: {painted}"
+        );
+        assert!(
+            !painted.contains("line 1"),
+            "scrolled-off head (line 1) should be clipped: {painted}"
+        );
+        root.dispose();
+    }
+
     #[test]
     fn focused_button_does_not_invert_child_text_by_default() {
         let mut nodes = Vec::new();
@@ -849,7 +997,7 @@ mod tests {
         let seven = seven.expect("button child text should paint");
 
         assert!(
-            !seven.style.invert,
+            !seven.style.add_modifier.contains(crate::text::Modifier::REVERSED),
             "focus should not force reversed-video text"
         );
         root.dispose();

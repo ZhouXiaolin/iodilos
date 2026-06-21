@@ -335,4 +335,24 @@ mod tests {
         assert!(top.contains("master"));
         assert!(top.contains("▶"));
     }
+
+    #[test]
+    fn dbg_every_row_exactly_width() {
+        for &w in &[
+            30usize, 34, 40, 50, 60, 72, 73, 74, 75, 76, 77, 80, 100, 120, 200,
+        ] {
+            for &(buf, cur) in &[
+                ("", 0usize),
+                ("hello world", 5usize),
+                ("你好世界 test 你好", 3usize),
+            ] {
+                let s = render(buf, cur, w);
+                for i in 0..s.row_count() {
+                    let txt = row_text(&s, i);
+                    let rw = row_width(&s, i);
+                    assert_eq!(rw, w, "width={w} buf={buf:?} row{i} rw={rw} txt={txt:?}");
+                }
+            }
+        }
+    }
 }

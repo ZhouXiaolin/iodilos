@@ -49,6 +49,7 @@ fn app() -> View {
             flex_direction = FlexDirection::Column,
             width = Size::Percent(100.0),
             height = Size::Percent(100.0),
+            tabindex = "0",
             on:terminal_resize = move |event: Event| {
                 if let Some((cols, _rows)) = event.resize() {
                     term_cols.set(cols as usize);

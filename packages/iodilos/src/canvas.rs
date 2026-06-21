@@ -266,10 +266,18 @@ impl Canvas {
         write!(w, csi!("0m"))?;
         for y in 0..self.height() {
             queue_move_to(w, 0, y as u16)?;
+            // Clear the WHOLE line before writing any cells, not after. A
+            // trailing "clear to end-of-line" (`CSI K`, EL 0) erases starting at
+            // the cursor — and on a full row the cursor ends up on the very last
+            // cell (with a deferred autowrap pending), so `CSI K` would erase
+            // the last cell we just drew. That deleted the prompt-box's closing
+            // `─╮` / `─╯` on every full-width row. `CSI 2K` (EL 2) clears the
+            // entire line first, then the cells we emit below replace it.
+            write!(w, csi!("2K"))?;
             let row = &self.cells[y];
             // Emit cells left-to-right. A wide glyph occupies two columns: the
-            // terminal advances its cursor two columns when we write it, and
-            // the following cell is the glyph's blanked second half — skip it,
+            // terminal advances its cursor two columns when we write it, and the
+            // following cell is the glyph's blanked second half — skip it,
             // otherwise the extra space shifts the rest of the row right and
             // clips the last column.
             let mut skip_next = false;
@@ -287,7 +295,6 @@ impl Canvas {
                 write!(w, "{}", SetBackgroundColor(Color::Reset))?;
                 background = None;
             }
-            write!(w, csi!("K"))?; // clear to end of line
         }
         write!(w, csi!("0m"))?;
         w.flush()?;
@@ -553,6 +560,28 @@ mod tests {
         assert!(
             !after.starts_with(' '),
             "wide char's trailing cell was emitted as a space, shifting the row: {after:?}"
+        );
+    }
+
+    #[test]
+    fn write_ansi_keeps_last_column_on_a_full_row() {
+        // Regression for the prompt-box right-border disappearing: when a row is
+        // filled to the very last terminal column, emitting `CSI K` (erase to
+        // end-of-line) after the last cell erases it, because the terminal's
+        // cursor is left on that last cell with a deferred wrap pending.
+        // `write_ansi` must keep the printed glyph for the final column.
+        use crate::text::SpanStyle;
+        let mut canvas = Canvas::empty(Rect::new(0, 0, 5, 1));
+        canvas.set_text(Rect::new(0, 0, 5, 1), "abcdZ", SpanStyle::default());
+        let mut out = Vec::new();
+        canvas.write_ansi(&mut out).unwrap();
+        let s = String::from_utf8(out).unwrap();
+        // The 'Z' must be emitted (not erased by the trailing clear-to-EOL).
+        let idx = s.find('Z').expect("last column char emitted");
+        let tail = &s[idx + 1..];
+        assert!(
+            !tail.starts_with("\x1b[K"),
+            "trailing clear-to-EOL erases the last-column char on a full row: {tail:?}"
         );
     }
 }

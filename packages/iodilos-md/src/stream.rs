@@ -245,9 +245,13 @@ impl StreamingParser {
                     // preceded) may already be captured in `best`.
                     fence = Some(open);
                 } else if trimmed_start.is_empty() {
-                    // Blank line outside any fence: a safe block separator. We
-                    // can commit through the end of this blank line.
-                    best = line_end;
+                    // Blank line outside any fence: a safe block separator. The
+                    // separator itself belongs to the committed side (see the
+                    // module/fn doc comments), so commit through the blank
+                    // line *and* its terminating newline. `line_end` points AT
+                    // the `\n`; advancing past it leaves the tail starting
+                    // cleanly at the next line.
+                    best = step_past_newline(bytes, line_end);
                 }
                 // A non-blank, non-fence line is ordinary content (paragraph,
                 // heading, list, table row…). It may or may not close its block

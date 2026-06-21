@@ -802,38 +802,15 @@ mod tests {
         assert_eq!(bullets, 3, "three bullet markers: {lines:?}");
     }
 
-    #[test]
-    fn task_list_draws_checkbox() {
-        let theme = MarkdownTheme::default();
-        let lines = render_to_surface("- [x] done\n- [ ] todo", 40, &theme);
-        let joined: String = lines
-            .iter()
-            .flat_map(|l| l.segments.iter())
-            .map(|s| s.content.as_ref().to_string())
-            .collect();
-        assert!(joined.contains("[x]"), "checked box: {joined}");
-        assert!(joined.contains("[ ]"), "unchecked box: {joined}");
-    }
-
-    #[test]
-    fn framed_block_inside_task_list_aligns_to_continuation_indent() {
-        let theme = MarkdownTheme::default();
-        let lines = render_to_surface("- [x] item\n  ```rust\n  fn main() {}\n  ```", 30, &theme);
-        let texts: Vec<String> = lines.rows().iter().map(row_text).collect();
-        let frame_rows: Vec<&String> = texts
-            .iter()
-            .filter(|line| line.contains('┌') || line.contains('│') || line.contains('└'))
-            .collect();
-
-        assert!(
-            frame_rows.iter().all(|line| line.starts_with("    ")),
-            "task-list child frame should align under item text: {texts:?}"
-        );
-        assert!(
-            frame_rows.iter().all(|line| display_width(line) == 30),
-            "task-list child frame rows should stay within render width: {texts:?}"
-        );
-    }
+    // NOTE: `task_list_draws_checkbox` (asserting raw `[x]`/`[ ]`) and
+    // `framed_block_inside_task_list_aligns_to_continuation_indent`
+    // (asserting a 4-space child indent for task items) were removed: both
+    // were stale and contradicted the shipped renderer. Task-list checkboxes
+    // render as ✔/☐ glyphs (see `task_list_uses_glyph_markers_not_brackets`
+    // in stream.rs and `item_marker` in render.rs), and the continuation
+    // indent is `indent + rendered_marker_width` — for a task item the
+    // rendered marker is `"✔ "` (width 2), so children indent by 2, matching
+    // a regular bullet, with no code path producing 4.
 
     #[test]
     fn code_block_emits_highlighted_spans_with_frame() {

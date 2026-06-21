@@ -633,6 +633,7 @@ dependencies = [
  "futures-timer",
  "iodilos",
  "iodilos-md",
+ "iodilos-prompt",
  "mexprp",
  "serde",
  "tokio",
@@ -659,6 +660,14 @@ dependencies = [
  "syntect",
  "unicode-width",
  "unicodeit",
+]
+
+[[package]]
+name = "iodilos-prompt"
+version = "0.1.0"
+dependencies = [
+ "iodilos",
+ "unicode-width",
 ]
 
 [[package]]

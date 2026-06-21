@@ -1,28 +1,19 @@
 # iodilos
 
-A standalone reactive terminal UI library, derived from the `sycamore-tui`
-package of the [Sycamore](https://github.com/sycamore-rs/sycamore) project.
+A standalone reactive terminal UI library (reactive primitives derived from
+Sycamore). Two component libraries are being prepared for the **flown** project:
 
-The reactive primitives (from `sycamore-reactive`) and the component model
-(from `sycamore-core`) are vendored inline, so iodilos has no external
-`sycamore-*` runtime dependency.
+- **Reactive core** — signals, memos, effects with automatic dependency tracking
+- **Canvas renderer** — frame-diffing ANSI output via crossterm, minimal writes
+- **TextSurface** — flat line-buffer text primitive with per-span styling
+- **Flexbox layout** — powered by taffy
+- **`view!` macro** — declarative UI DSL
 
-## Layout
+## iodilos-md — streaming Markdown
 
-```
-packages/
-  iodilos/          # main crate (runtime + vendored reactive/component)
-  iodilos-macros/   # view! proc-macro + inlined view-syntax parser
-  iodilos-md/       # streaming Markdown component library (pulldown-cmark + syntect)
-examples/           # single-file examples (cargo run --example <name>)
-```
-
-## Streaming Markdown
-
-`iodilos-md` parses Markdown into an iodilos `View` tree imperatively (no
-`view!` macro), so it rebuilds cleanly when driven from a `Signal<String>`.
-The `markdown` example feeds a document in character-by-character to simulate a
-token stream:
+Parses Markdown (`pulldown-cmark`) into a `TextSurface` — syntax highlighting
+via `syntect`, inline LaTeX via `unicodeit`, Mermaid flowcharts via `mmdflux`.
+Driven from a `Signal<String>` + width signal:
 
 ```
 cargo run --example markdown
@@ -31,6 +22,28 @@ cargo run --example markdown
 Keys: `↑`/`↓` and mouse wheel scroll, `PgUp`/`PgDn` page, `F` toggles
 follow-the-tail, `Q` quits.
 
+## iodilos-prompt — framed multiline prompt
+
+Statusline + rounded-frame prompt box with block cursor and `PromptModel`
+editing model. Pure rendering; reactive wiring left to the application:
+
+```
+cargo run --example prompt_box
+```
+
+Keys: printable chars insert, `Backspace` deletes, `←`/`→` move cursor,
+`Shift+Enter`/`Alt+Enter` newline, `Enter` submits, `Ctrl+C` quits.
+
+## Layout
+
+```
+packages/
+  iodilos/          # main crate (runtime + reactive + layout + canvas)
+  iodilos-macros/   # view! proc-macro
+  iodilos-md/       # streaming Markdown (for flown)
+  iodilos-prompt/   # framed multiline prompt (for flown)
+examples/           # cargo run --example <name>
+```
 
 ## Quick start
 
@@ -49,8 +62,6 @@ fn main() -> std::io::Result<()> {
     render(app)
 }
 ```
-
-Run an example:
 
 ```
 cargo run --example counter

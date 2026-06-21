@@ -267,8 +267,21 @@ impl Canvas {
         for y in 0..self.height() {
             queue_move_to(w, 0, y as u16)?;
             let row = &self.cells[y];
+            // Emit cells left-to-right. A wide glyph occupies two columns: the
+            // terminal advances its cursor two columns when we write it, and
+            // the following cell is the glyph's blanked second half — skip it,
+            // otherwise the extra space shifts the rest of the row right and
+            // clips the last column.
+            let mut skip_next = false;
             for cell in row {
+                if skip_next {
+                    skip_next = false;
+                    continue;
+                }
                 emit_cell(w, cell, &mut background, &mut text_style)?;
+                if cell.character.as_ref().is_some_and(|c| c.width() > 1) {
+                    skip_next = true;
+                }
             }
             if background.is_some() {
                 write!(w, "{}", SetBackgroundColor(Color::Reset))?;
@@ -517,6 +530,29 @@ mod tests {
                 .style
                 .fg,
             None
+        );
+    }
+
+    #[test]
+    fn write_ansi_skips_wide_char_trailing_cell() {
+        // A width-2 glyph consumes two terminal columns; the canvas blanks the
+        // second one (character = None). `write_ansi` emits cells sequentially,
+        // so the terminal advances its cursor two columns for the glyph — if we
+        // then also emit the blank trailing cell as a space, that space is an
+        // EXTRA column that shifts the rest of the row right and clips the last
+        // column on a real terminal. The trailing cell must be skipped.
+        use crate::text::SpanStyle;
+        let mut canvas = Canvas::empty(Rect::new(0, 0, 4, 1));
+        canvas.set_text(Rect::new(0, 0, 4, 1), "好XY", SpanStyle::default());
+        let mut out = Vec::new();
+        canvas.write_ansi(&mut out).unwrap();
+        let s = String::from_utf8(out).unwrap();
+        let wide = "好";
+        let idx = s.find(wide).expect("wide glyph emitted");
+        let after = &s[idx + wide.len()..];
+        assert!(
+            !after.starts_with(' '),
+            "wide char's trailing cell was emitted as a space, shifting the row: {after:?}"
         );
     }
 }

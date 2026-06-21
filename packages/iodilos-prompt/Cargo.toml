@@ -1,0 +1,15 @@
+[package]
+name = "iodilos-prompt"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+description = "A statusline + framed multiline prompt component for iodilos TUI"
+
+[lib]
+name = "iodilos_prompt"
+path = "src/lib.rs"
+
+[dependencies]
+iodilos = { path = "../iodilos" }
+unicode-width = "0.2"

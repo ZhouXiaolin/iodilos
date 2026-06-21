@@ -5,6 +5,7 @@ members = [
     "packages/iodilos",
     "packages/iodilos-macros",
     "packages/iodilos-md",
+    "packages/iodilos-prompt",
 ]
 
 [package]
@@ -27,4 +28,6 @@ serde = { version = "1.0.210", features = ["derive"] }
 ureq = { version = "2.12.1", features = ["json"] }
 # example-specific deps (markdown): the in-tree streaming markdown component lib.
 iodilos-md = { path = "packages/iodilos-md" }
+# example-specific deps (prompt_box): the in-tree prompt component lib.
+iodilos-prompt = { path = "packages/iodilos-prompt" }
 

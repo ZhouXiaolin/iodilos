@@ -4,3 +4,7 @@
 //! multiline input below, a self-drawn block cursor — into an iodilos
 //! `TextSurface`. Pure rendering + an editing model; reactive wiring is left
 //! to the application (see `examples/prompt_box.rs`).
+
+mod model;
+
+pub use model::PromptModel;

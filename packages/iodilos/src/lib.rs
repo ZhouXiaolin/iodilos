@@ -37,7 +37,7 @@ pub use events::{Event, EventKind};
 pub use node::{AsTuiNode, NodeId, TuiNode};
 pub use noderef::NodeRef;
 pub use reactive::*;
-pub use render::{render, render_async, use_future};
+pub use render::{QuitPolicy, RenderConfig, render, render_async, render_async_with, render_with, use_future};
 pub use style::{
     BorderCharacters, BorderStyle, Edges, FlexBasis, Gap, Inset, Margin, Padding, Percent, Size,
     Style, Weight,
@@ -71,7 +71,9 @@ pub mod prelude {
     pub use crate::events::{Event, EventKind};
     pub use crate::node::{NodeId, TuiNode};
     pub use crate::noderef::NodeRef;
-    pub use crate::render::{render, render_async, use_future};
+    pub use crate::render::{
+        QuitPolicy, RenderConfig, render, render_async, render_async_with, render_with, use_future,
+    };
     pub use crate::style::{
         BorderCharacters, BorderStyle, Edges, FlexBasis, Gap, Inset, Margin, Padding, Percent,
         Size, Style, Weight,

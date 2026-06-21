@@ -20,7 +20,8 @@ use crate::reactive::{
 use crossterm::cursor::{Hide, Show};
 use crossterm::event::{
     DisableMouseCapture, EnableMouseCapture, Event as CrosstermEvent, EventStream, KeyCode,
-    KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
+    KeyboardEnhancementFlags, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -83,6 +84,7 @@ struct RenderState {
     focused: Option<NodeId>,
     hovered: Option<NodeId>,
     mouse_down: Option<NodeId>,
+    quit: QuitPolicy,
 }
 
 /// Start a future tied to the current TUI reactive scope.
@@ -153,7 +155,7 @@ impl RenderState {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> bool {
-        if is_quit_key(key) {
+        if is_quit_key(key, self.quit) {
             return false;
         }
         if key.kind == KeyEventKind::Press && key.code == KeyCode::Tab {
@@ -358,15 +360,58 @@ fn diff_and_draw<W: Write>(w: &mut W, prev: &Canvas, next: &Canvas) -> io::Resul
     Ok(())
 }
 
+/// Optional configuration for [`render_async_with`] / [`render_with`]. Defaults
+/// reproduce the historical behaviour of [`render`] / [`render_async`].
+#[derive(Debug, Clone, Default)]
+pub struct RenderConfig {
+    /// Push the kitty keyboard protocol (CSI u, `DISAMBIGUATE_ESCAPE_KEYS`) so
+    /// modifier-bearing keys (Shift+Enter, Alt+Enter, …) are reported
+    /// distinctly. No-op on terminals without support; only truly effective on
+    /// Unix. Pushed after entering the alt screen and popped before leaving.
+    pub keyboard_enhancement: bool,
+    /// Which keys quit the render loop. The built-in `'q'` quit is unsuitable
+    /// for text-input apps (it fires before `raw_key` dispatch and cannot be
+    /// stopped via `stop_propagation`); switch to [`QuitPolicy::CtrlCOnly`].
+    pub quit: QuitPolicy,
+}
+
+/// Quit-key policy for the render loop.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum QuitPolicy {
+    /// Quit on plain `'q'` or `Ctrl+C` (the historical default).
+    #[default]
+    QOrCtrlC,
+    /// Quit only on `Ctrl+C` (lets the app type `'q'`).
+    CtrlCOnly,
+    /// Never auto-quit; the app handles its own exit.
+    None,
+}
+
 /// Render a TUI view asynchronously and run until `q` or Ctrl-C.
 ///
 /// This function is executor-agnostic: it does not spawn onto tokio, smol, or
 /// async-std. Futures registered with [`use_future`] are polled inside this
 /// render loop.
 pub async fn render_async(view: impl FnOnce() -> View<TuiNode> + 'static) -> io::Result<()> {
+    render_async_with(view, RenderConfig::default()).await
+}
+
+/// Like [`render_async`] but with optional [`RenderConfig`] (kitty keyboard
+/// protocol, quit-key policy).
+pub async fn render_async_with(
+    view: impl FnOnce() -> View<TuiNode> + 'static,
+    cfg: RenderConfig,
+) -> io::Result<()> {
     enable_raw_mode()?;
     let mut stdout = stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture, Hide)?;
+    if cfg.keyboard_enhancement {
+        // No-op on unsupported terminals/platforms; swallow the error.
+        let _ = execute!(
+            stdout,
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        );
+    }
     let (task_tx, task_rx) = unbounded();
     let (redraw_tx, redraw_rx) = unbounded();
     let runtime = TuiRuntime { task_tx, redraw_tx };
@@ -379,6 +424,7 @@ pub async fn render_async(view: impl FnOnce() -> View<TuiNode> + 'static) -> io:
         focused: None,
         hovered: None,
         mouse_down: None,
+        quit: cfg.quit,
     }));
 
     let root = create_root({
@@ -395,6 +441,9 @@ pub async fn render_async(view: impl FnOnce() -> View<TuiNode> + 'static) -> io:
 
     {
         let mut state = state.borrow_mut();
+        if cfg.keyboard_enhancement {
+            let _ = execute!(state.stdout, PopKeyboardEnhancementFlags);
+        }
         disable_raw_mode()?;
         execute!(
             state.stdout,
@@ -414,6 +463,15 @@ pub async fn render_async(view: impl FnOnce() -> View<TuiNode> + 'static) -> io:
 pub fn render(view: impl FnOnce() -> View<TuiNode> + 'static) -> io::Result<()> {
     let mut pool = futures::executor::LocalPool::new();
     pool.run_until(render_async(view))
+}
+
+/// Like [`render`] but with optional [`RenderConfig`].
+pub fn render_with(
+    view: impl FnOnce() -> View<TuiNode> + 'static,
+    cfg: RenderConfig,
+) -> io::Result<()> {
+    let mut pool = futures::executor::LocalPool::new();
+    pool.run_until(render_async_with(view, cfg))
 }
 
 async fn run_loop(
@@ -551,10 +609,17 @@ fn attribute_value_in_nodes(nodes: &[TuiNode], id: NodeId, name: &str) -> Option
     None
 }
 
-fn is_quit_key(key: KeyEvent) -> bool {
-    key.kind == KeyEventKind::Press
-        && (matches!(key.code, KeyCode::Char('q'))
-            || matches!(key.code, KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL)))
+fn is_quit_key(key: KeyEvent, policy: QuitPolicy) -> bool {
+    if key.kind != KeyEventKind::Press {
+        return false;
+    }
+    let ctrl_c =
+        matches!(key.code, KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL));
+    match policy {
+        QuitPolicy::QOrCtrlC => matches!(key.code, KeyCode::Char('q')) || ctrl_c,
+        QuitPolicy::CtrlCOnly => ctrl_c,
+        QuitPolicy::None => false,
+    }
 }
 
 fn is_activation_key(key: KeyEvent) -> bool {
@@ -892,5 +957,26 @@ mod tests {
             out.push('\n');
         }
         out
+    }
+
+    #[test]
+    fn render_config_defaults_match_legacy_behaviour() {
+        let cfg = RenderConfig::default();
+        assert!(!cfg.keyboard_enhancement);
+        assert_eq!(cfg.quit, QuitPolicy::QOrCtrlC);
+    }
+
+    #[test]
+    fn quit_policy_respects_setting() {
+        // Legacy: plain 'q' quits.
+        let q = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::empty());
+        assert!(is_quit_key(q, QuitPolicy::QOrCtrlC));
+        assert!(!is_quit_key(q, QuitPolicy::CtrlCOnly));
+        assert!(!is_quit_key(q, QuitPolicy::None));
+        // Ctrl+C always quits (except None).
+        let ctrlc = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(is_quit_key(ctrlc, QuitPolicy::QOrCtrlC));
+        assert!(is_quit_key(ctrlc, QuitPolicy::CtrlCOnly));
+        assert!(!is_quit_key(ctrlc, QuitPolicy::None));
     }
 }

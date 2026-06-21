@@ -6,9 +6,11 @@
 //! to the application (see `examples/prompt_box.rs`).
 
 mod model;
+pub mod render;
 pub mod statusline;
 pub mod theme;
 
 pub use model::PromptModel;
+pub use render::render_prompt_to_surface;
 pub use statusline::{StatusField, StatusLine};
 pub use theme::PromptTheme;

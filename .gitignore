@@ -7,3 +7,6 @@
 
 # Trunk output
 /**/dist
+.codegraph
+.qoder
+docs

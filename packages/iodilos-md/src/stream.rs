@@ -33,10 +33,10 @@
 //! until a blank line arrives — the last row/line of such a block simply
 //! re-renders each tick, which is the desired streaming behavior.
 
-use iodilos::text::Line;
+use iodilos::surface::TextSurface;
 
-use crate::parser::{parse, Block};
-use crate::render::render_blocks_to_lines;
+use crate::parser::{Block, parse};
+use crate::render::{inlines_to_string, render_blocks_to_surface};
 use crate::theme::MarkdownTheme;
 
 /// A stateful, append-only streaming Markdown parser.
@@ -53,6 +53,14 @@ pub struct StreamingParser {
     /// The committed prefix source itself, kept so newly committed slices can be
     /// parsed incrementally (append + reparse only the new slice's blocks).
     committed_src: String,
+    /// Sticky cache for the open-tail Mermaid block: `(source at last successful
+    /// parse, rendered diagram at that point)`. While a mermaid fence streams
+    /// open, partial input intermittently fails to parse; instead of flickering
+    /// back to raw source, we keep showing the last successful diagram until the
+    /// source parses again or diverges (block switch). Only the open tail is
+    /// affected — once the fence closes the block enters the committed prefix
+    /// and is parsed for real each tick (the stable final state).
+    tail_mermaid: Option<(String, String)>,
 }
 
 impl Default for StreamingParser {
@@ -68,6 +76,7 @@ impl StreamingParser {
             committed_len: 0,
             committed_blocks: Vec::new(),
             committed_src: String::new(),
+            tail_mermaid: None,
         }
     }
 
@@ -119,23 +128,34 @@ impl StreamingParser {
         // rest is this tick's tail. Cache the committed portion back and return
         // the full list.
         let committed_count = all.len() - tail_count;
+        // Apply the sticky Mermaid cache to the open tail only: resolve a
+        // `diagram` for each tail Mermaid block so the renderer need not
+        // re-parse (and flicker) on partial input. Committed blocks are left
+        // untouched (`diagram = None`) — they are closed and parsed for real.
+        self.resolve_tail_mermaid(&mut all[committed_count..]);
+        // Absorb streaming-incomplete table data rows: a `|`-prefixed Paragraph
+        // right after a confirmed Table is pulldown-cmark's view of a data row
+        // whose trailing `|` has not arrived yet. Folding it into the Table
+        // now keeps the rendered height monotonic across ticks (no recession
+        // when the `|` finally closes). See `absorb_streaming_table_rows`.
+        absorb_streaming_table_rows(&mut all, committed_count);
         self.committed_blocks = all[..committed_count].to_vec();
         all
     }
 
-    /// Feed the full current source, render the resulting blocks to a flat
-    /// `Vec<Line>` at `width`, and return it. The committed prefix is parsed
+    /// Feed the full current source, render the resulting blocks to a
+    /// `TextSurface` at `width`, and return it. The committed prefix is parsed
     /// incrementally; only the open tail is re-parsed each call (see [`feed`](Self::feed)).
-    /// The block→`Line` conversion is whole-rebuild per call (committed-prefix
-    /// `Line` caching is deferred to Plan 4).
-    pub fn feed_to_lines(
+    /// The block→surface conversion is whole-rebuild per call (committed-prefix
+    /// surface caching is deferred).
+    pub fn feed_to_surface(
         &mut self,
         src: &str,
         width: usize,
         theme: &MarkdownTheme,
-    ) -> Vec<Line> {
+    ) -> TextSurface {
         let blocks = self.feed(src);
-        render_blocks_to_lines(&blocks, width, theme)
+        render_blocks_to_surface(&blocks, width, theme)
     }
 
     /// The byte length of the committed (cached) prefix. Exposed for tests.
@@ -148,6 +168,38 @@ impl StreamingParser {
         self.committed_len = 0;
         self.committed_blocks.clear();
         self.committed_src.clear();
+        self.tail_mermaid = None;
+    }
+
+    /// Resolve the `diagram` of every top-level Mermaid block in the open tail
+    /// via the sticky cache. See [`StreamingParser::tail_mermaid`].
+    fn resolve_tail_mermaid(&mut self, tail: &mut [Block]) {
+        for block in tail.iter_mut() {
+            if let Block::Mermaid { src, diagram } = block {
+                *diagram = self.resolve_one_mermaid(src);
+            }
+        }
+    }
+
+    /// Return the diagram text to display for a single tail Mermaid `src`, or
+    /// `None` to let the renderer fall back to colored source. Sticky rules:
+    /// - fresh parse succeeds → refresh the cache, return the new diagram;
+    /// - parse fails but `src` only grew since the last success → reuse the
+    ///   cached diagram (no flicker);
+    /// - parse fails and `src` diverged (different block / non-append edit) →
+    ///   drop the stale cache; the renderer falls back to source.
+    fn resolve_one_mermaid(&mut self, src: &str) -> Option<String> {
+        if let Some(rendered) = crate::mermaid::render(src) {
+            self.tail_mermaid = Some((src.to_string(), rendered.clone()));
+            return Some(rendered);
+        }
+        if let Some((ok_src, ok_rendered)) = &self.tail_mermaid
+            && src.starts_with(ok_src.as_str())
+        {
+            return Some(ok_rendered.clone());
+        }
+        self.tail_mermaid = None;
+        None
     }
 
     /// Scan from `committed_len` forward, tracking fence state, and return the
@@ -171,7 +223,7 @@ impl StreamingParser {
         let mut best = start;
 
         let mut line_start = start;
-        while line_start <= bytes.len() {
+        while line_start < bytes.len() {
             let line_end = next_line_end(bytes, line_start);
             let line = &src[line_start..line_end];
             let trimmed_start = line.trim_start_matches(' ');
@@ -212,6 +264,60 @@ impl StreamingParser {
 
         best
     }
+}
+
+/// Streaming-table absorb: once a Table is confirmed (header + separator
+/// arrived), pulldown-cmark still emits a *half-arrived* data row (no trailing
+/// `|`) as a standalone Paragraph that wraps taller than one table row. When
+/// the trailing `|` arrives, pulldown-cmark re-absorbs that Paragraph into the
+/// Table — the total height *recedes*, so a follow-tail viewport jumps upward.
+/// Folding such a Paragraph into the preceding Table's rows here makes the
+/// incomplete and complete states render identically (one table row each), so
+/// the height is monotonic across ticks. Only the open tail (from
+/// `committed_count`) is eligible — committed blocks are already closed. See
+/// `docs/superpowers/specs/2026-06-21-table-streaming-absorb-design.md`.
+fn absorb_streaming_table_rows(all: &mut Vec<Block>, committed_count: usize) {
+    let mut i = committed_count;
+    while i + 1 < all.len() {
+        let absorb = matches!(all[i], Block::Table(_))
+            && paragraph_is_streaming_table_row(&all[i + 1]);
+        if absorb {
+            // `remove` shifts later blocks down by one; the block that lands
+            // at i+1 may itself be another absorbable `|`-row (several data
+            // rows streaming back-to-back), so do not advance i here.
+            let Block::Paragraph(inlines) = all.remove(i + 1) else {
+                unreachable!("guarded by paragraph_is_streaming_table_row");
+            };
+            let line = inlines_to_string(&inlines);
+            if let Block::Table(table) = &mut all[i] {
+                table.rows.push(split_table_row(&line));
+            }
+        } else {
+            i += 1;
+        }
+    }
+}
+
+/// Whether `block` is a Paragraph that reads like one streaming table data
+/// row: a single line (no soft break → no `\n` once flattened) whose trimmed
+/// text starts with `|`. That is pulldown-cmark's rendering of an incomplete
+/// `| a | b` (no trailing `|`).
+fn paragraph_is_streaming_table_row(block: &Block) -> bool {
+    let Block::Paragraph(inlines) = block else {
+        return false;
+    };
+    let line = inlines_to_string(inlines);
+    !line.contains('\n') && line.trim_start().starts_with('|')
+}
+
+/// Split a `|`-delimited table data line into trimmed cells, tolerating a
+/// missing leading/trailing `|` (the streaming-incomplete case):
+/// `| a | b` → `["a","b"]`, `| a | b |` → `["a","b"]`, `| a` → `["a"]`.
+fn split_table_row(line: &str) -> Vec<String> {
+    let s = line.trim();
+    let s = s.strip_prefix('|').unwrap_or(s);
+    let s = s.strip_suffix('|').unwrap_or(s);
+    s.split('|').map(|c| c.trim().to_string()).collect()
 }
 
 /// An open code fence's identity: the marker character and its run length.
@@ -302,10 +408,12 @@ mod tests {
                 Block::Paragraph(_) => "paragraph",
                 Block::CodeBlock { .. } => "code",
                 Block::List(_) => "list",
-                Block::BlockQuote(_) => "quote",
+                Block::BlockQuote { .. } => "quote",
+                Block::Frontmatter(_) => "frontmatter",
                 Block::Rule => "rule",
                 Block::Table(_) => "table",
                 Block::Math(_) => "math",
+                Block::Mermaid { .. } => "mermaid",
             })
             .collect()
     }
@@ -335,7 +443,10 @@ mod tests {
         // The unclosed fence must not have swallowed the intro into a code block:
         // there should be at most one code block, and it should be the fence, not
         // the whole document.
-        let code_count = b1.iter().filter(|x| matches!(x, Block::CodeBlock { .. })).count();
+        let code_count = b1
+            .iter()
+            .filter(|x| matches!(x, Block::CodeBlock { .. }))
+            .count();
         assert!(
             code_count <= 1,
             "tick1 should not over-produce code blocks: {:?}",
@@ -362,7 +473,10 @@ mod tests {
         let mut p = StreamingParser::new();
         let _ = p.feed("a\n\n");
         let after_first = p.committed_len();
-        assert!(after_first >= 2, "blank-terminated line commits: {after_first}");
+        assert!(
+            after_first >= 2,
+            "blank-terminated line commits: {after_first}"
+        );
         let _ = p.feed("a\n\nb\n\n");
         let after_second = p.committed_len();
         assert!(
@@ -377,7 +491,11 @@ mod tests {
         let mut p = StreamingParser::new();
         let src = "before\n\n```rust\nfn x() {}\n```\n\nafter\n\n";
         let blocks = p.feed(src);
-        assert!(kinds(&blocks).contains(&"code"), "code block rendered: {:?}", kinds(&blocks));
+        assert!(
+            kinds(&blocks).contains(&"code"),
+            "code block rendered: {:?}",
+            kinds(&blocks)
+        );
         // The whole source ends in a blank line, so it should be fully committed.
         assert_eq!(p.committed_len(), src.len(), "fully committed");
     }
@@ -440,7 +558,13 @@ mod tests {
         let blocks = p.feed("energy is $E=mc^2$ here\n\n");
         let para = blocks
             .iter()
-            .find_map(|b| if let Block::Paragraph(i) = b { Some(i) } else { None })
+            .find_map(|b| {
+                if let Block::Paragraph(i) = b {
+                    Some(i)
+                } else {
+                    None
+                }
+            })
             .expect("a paragraph");
         assert!(
             para.iter().any(|i| matches!(i, Inline::Math(_))),
@@ -471,20 +595,330 @@ mod tests {
     }
 
     #[test]
-    fn feed_to_lines_renders_committed_and_tail() {
+    fn feed_to_surface_renders_committed_and_tail() {
         let mut p = StreamingParser::new();
         let theme = crate::MarkdownTheme::default();
         // tick 1: a committed paragraph + an open tail paragraph
-        let l1 = p.feed_to_lines("intro\n\nunfinished", 60, &theme);
+        let l1 = p.feed_to_surface("intro\n\nunfinished", 60, &theme);
         let joined: String = l1
             .iter()
-            .flat_map(|l| l.spans.iter())
+            .flat_map(|l| l.segments.iter())
             .map(|s| s.content.as_ref().to_string())
             .collect();
-        assert!(joined.contains("intro"), "committed paragraph present: {joined}");
+        assert!(
+            joined.contains("intro"),
+            "committed paragraph present: {joined}"
+        );
         assert!(
             joined.contains("unfinished"),
             "tail paragraph present: {joined}"
         );
+    }
+
+    /// Extract the `diagram` of the last Mermaid block in the list (the tail
+    /// block while a mermaid fence is streaming open).
+    fn tail_mermaid_diagram(blocks: &[Block]) -> Option<String> {
+        blocks.iter().rev().find_map(|b| match b {
+            Block::Mermaid { diagram, .. } => diagram.clone(),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn tail_mermaid_sticky_reuses_last_success_when_parse_fails() {
+        // Streaming mermaid (fence still open) grows character by character.
+        // The full `ok` content parses; appending an unterminated node `D[`
+        // makes the whole thing fail. Sticky should keep the failed tick
+        // showing the last successful diagram instead of falling back to raw.
+        let ok = "flowchart TD\n    A[Start] --> B{Ready?}\n    B -->|yes| C[Ship]";
+        let rendered_ok =
+            crate::mermaid::render(ok).expect("fixture: ok content renders");
+        assert!(
+            crate::mermaid::render(&format!("{ok}\n    D[")).is_none(),
+            "fixture: ok + unterminated node must fail"
+        );
+
+        let mut p = StreamingParser::new();
+        let d1 = {
+            let b = p.feed(&format!("```mermaid\n{ok}"));
+            tail_mermaid_diagram(&b)
+        };
+        assert_eq!(
+            d1.as_deref(),
+            Some(rendered_ok.as_str()),
+            "tick1 full content parses → diagram = rendered result"
+        );
+
+        let d2 = {
+            let b = p.feed(&format!("```mermaid\n{ok}\n    D["));
+            tail_mermaid_diagram(&b)
+        };
+        assert_eq!(
+            d2.as_deref(),
+            Some(rendered_ok.as_str()),
+            "tick2 parse fails → sticky reuses last success, not None/raw"
+        );
+    }
+
+    #[test]
+    fn tail_mermaid_never_parsed_falls_back_to_raw() {
+        // No prior success → no sticky. Raw source throughout.
+        let bad = "flowchart TD\n    A[";
+        assert!(
+            crate::mermaid::render(bad).is_none(),
+            "fixture: bad content never parses"
+        );
+        let mut p = StreamingParser::new();
+        let b1 = p.feed(&format!("```mermaid\n{bad}"));
+        assert_eq!(tail_mermaid_diagram(&b1), None, "never parsed → no diagram");
+        let b2 = p.feed(&format!("```mermaid\n{bad}\n    B["));
+        assert_eq!(
+            tail_mermaid_diagram(&b2),
+            None,
+            "still never parsed → no diagram"
+        );
+    }
+
+    #[test]
+    fn closed_mermaid_drops_sticky_and_reparses() {
+        // Once the fence closes and commits, the block leaves the tail: its
+        // `diagram` is None so the renderer re-parses the stable full source
+        // (the "final judgement" after closure, per the agreed semantics).
+        let ok = "flowchart TD\n    A[Start] --> B{Ready?}\n    B -->|yes| C[Ship]";
+        let mut p = StreamingParser::new();
+        let b1 = p.feed(&format!("```mermaid\n{ok}"));
+        assert!(
+            tail_mermaid_diagram(&b1).is_some(),
+            "open fence resolves a sticky diagram"
+        );
+        // Close the fence + blank line → mermaid commits out of the tail.
+        let b2 = p.feed(&format!("```mermaid\n{ok}\n```\n\n"));
+        let diagram = b2.iter().find_map(|b| match b {
+            Block::Mermaid { diagram, .. } => diagram.clone(),
+            _ => None,
+        });
+        assert_eq!(
+            diagram,
+            None,
+            "closed/committed mermaid carries no sticky diagram — re-parse for real"
+        );
+    }
+
+    #[test]
+    fn switched_mermaid_does_not_reuse_other_blocks_cache() {
+        // A streams and parses (cache = A). A closes. B streams with content
+        // that fails to parse AND does not extend A → B falls back to raw,
+        // never reusing A's cached diagram.
+        let a = "flowchart TD\n    A[Start] --> B{Ready?}\n    B -->|yes| C[Ship]";
+        let b = "flowchart TD\n    X --> Y\n    Z[";
+        crate::mermaid::render(a).expect("fixture: a renders");
+        assert!(crate::mermaid::render(b).is_none(), "fixture: b fails to parse");
+        let mut p = StreamingParser::new();
+        // tick1: A open and parses → cache = A.
+        p.feed(&format!("```mermaid\n{a}"));
+        // tick2: A closes and commits, then B streams open with bad content.
+        let blocks = p.feed(&format!("```mermaid\n{a}\n```\n\n```mermaid\n{b}"));
+        assert_eq!(
+            tail_mermaid_diagram(&blocks),
+            None,
+            "B (different block, unparseable) must not reuse A's cache"
+        );
+    }
+
+    #[test]
+    fn table_streaming_height_never_recedes() {
+        // Regression: streaming a GFM table char-by-char, the total surface row
+        // count must never *shrink* between ticks. Root cause (see
+        // docs/superpowers/specs/2026-06-21-table-streaming-absorb-design.md):
+        // pulldown-cmark parses an incomplete table data row (no trailing `|`)
+        // as a standalone Paragraph following the Table; when the trailing `|`
+        // arrives the Paragraph is absorbed into the Table, and — because the
+        // streaming Paragraph wraps taller than a single table row — the total
+        // height *recedes*, making a follow-tail viewport jump upward.
+        //
+        // Fix under test: once a Table is confirmed (header + separator
+        // arrived), a following single-line `|`-prefixed Paragraph is absorbed
+        // directly into the table's rows, so the incomplete and complete states
+        // render with the same height and no recession occurs.
+        let heading = "# A table\n\n";
+        let table = "| Feature    | Supported |\n\
+|------------|:---------:|\n\
+| Headings   |    yes    |\n\
+| Code       |    yes    |\n";
+        let full = format!("{heading}{table}");
+        let chars: Vec<char> = full.chars().collect();
+
+        let mut p = StreamingParser::new();
+        let theme = crate::MarkdownTheme::default();
+        let width = 40; // width at which a Δ=-1 recession was observed
+
+        let mut prev_total: usize = 0;
+        let mut recessions: Vec<String> = Vec::new();
+        for end in 1..=chars.len() {
+            let chunk: String = chars[..end].iter().collect();
+            let surface = p.feed_to_surface(&chunk, width, &theme);
+            let total = surface.row_count();
+            if total < prev_total {
+                let snippet: String = chars[end.saturating_sub(12)..end].iter().collect();
+                recessions.push(format!("end={end} {prev_total}→{total} …{snippet:?}"));
+            }
+            prev_total = total;
+        }
+        assert!(
+            recessions.is_empty(),
+            "row count must be monotonic non-decreasing across streaming ticks, \
+             but observed recessions: [{}]",
+            recessions.join(", ")
+        );
+    }
+
+    #[test]
+    fn table_body_rows_have_inner_horizontal_rules() {
+        // A multi-row table must draw a horizontal rule (├─┼─┤) between each
+        // pair of body rows, not only the top, header/body separator, and
+        // bottom. Without these inner rules the table reads as "header + outer
+        // frame only" and the inner row borders are missing.
+        let src = "| H1  | H2  |\n|-----|-----|\n| a   | b   |\n| c   | d   |\n";
+        let blocks = crate::parser::parse(src);
+        let theme = crate::MarkdownTheme::default();
+        let surface = crate::render::render_blocks_to_surface(&blocks, 40, &theme);
+        let rows: Vec<String> = surface
+            .rows()
+            .iter()
+            .map(|r| r.segments.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        let has_inner_rule = rows
+            .iter()
+            .any(|t| t.starts_with('├') && t.contains('┼') && t.ends_with('┤'));
+        assert!(
+            has_inner_rule,
+            "expected an inner body rule (├─┼─┤) between data rows, got:\n{}",
+            rows.join("\n")
+        );
+    }
+
+    #[test]
+    fn task_list_uses_glyph_markers_not_brackets() {
+        // Task list items render with ✔ (done) / ☐ (todo) glyphs instead of
+        // the raw `[x]` / `[ ]` checkbox characters.
+        let src = "- [ ] todo\n- [x] done\n";
+        let blocks = crate::parser::parse(src);
+        let theme = crate::MarkdownTheme::default();
+        let surface = crate::render::render_blocks_to_surface(&blocks, 40, &theme);
+        let text: String = surface
+            .rows()
+            .iter()
+            .flat_map(|r| r.segments.iter())
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(text.contains('✔'), "checked item should use ✔, got: {text:?}");
+        assert!(text.contains('☐'), "unchecked item should use ☐, got: {text:?}");
+        assert!(!text.contains("[x]"), "should not show raw [x]: {text:?}");
+        assert!(!text.contains("[ ]"), "should not show raw [ ]: {text:?}");
+    }
+
+    #[test]
+    fn _dbg_parse_incomplete_table() {
+        let cases: &[&str] = &[
+            "| Feature | Supported |\n|---|---|\n| Headings | yes",
+            "| Feature | Supported |\n|---|---|\n| Headings | yes |",
+            "| Feature | Supported |\n|---|---|\n| Headings | yes |\n| Code | yes",
+            "| Feature | Supported |\n|---|---|\n| Headings | yes |\n| Code | yes |",
+        ];
+        for c in cases {
+            let blocks = crate::parser::parse(c);
+            let k: Vec<String> = blocks
+                .iter()
+                .map(|b| match b {
+                    Block::Table(t) => format!("T(rows={},hdr={})", t.rows.len(), t.headers.len()),
+                    Block::Paragraph(i) => format!("P({:?})", inlines_to_string(i)),
+                    _ => "?".to_string(),
+                })
+                .collect();
+            eprintln!("[{c:?}] => {k:?}");
+        }
+    }
+
+    #[test]
+    fn _dbg_stream_table_ticks() {
+        let heading = "# A table\n\n";
+        let table = "| Feature    | Supported |\n\
+|------------|:---------:|\n\
+| Headings   |    yes    |\n\
+| Code       |    yes    |\n";
+        let full = format!("{heading}{table}");
+        let chars: Vec<char> = full.chars().collect();
+        let mut p = StreamingParser::new();
+        let theme = crate::MarkdownTheme::default();
+        let mut prev = 0usize;
+        for end in 1..=chars.len() {
+            let chunk: String = chars[..end].iter().collect();
+            let blocks = p.feed(&chunk);
+            let surface = crate::render::render_blocks_to_surface(&blocks, 40, &theme);
+            let total = surface.row_count();
+            if total != prev {
+                let k: Vec<String> = blocks
+                    .iter()
+                    .map(|b| match b {
+                        Block::Table(t) => format!("T{}", t.rows.len()),
+                        Block::Paragraph(i) => format!("P({:?})", inlines_to_string(i)),
+                        Block::Heading { .. } => "H".to_string(),
+                        _ => "?".to_string(),
+                    })
+                    .collect();
+                eprintln!(
+                    "end={end:3} rows={total:3} Δ={:+} clen={} {k:?}",
+                    total as i32 - prev as i32,
+                    p.committed_len()
+                );
+                prev = total;
+            }
+        }
+    }
+
+    #[test]
+    fn _dbg_render_table_dump() {
+        let src = "| Feature    | Supported |\n\
+|------------|:---------:|\n\
+| Headings   |    yes    |\n\
+| Code       |    yes    |\n";
+        let blocks = crate::parser::parse(src);
+        let theme = crate::MarkdownTheme::default();
+        let surface = crate::render::render_blocks_to_surface(&blocks, 40, &theme);
+        eprintln!("--- full table render ---");
+        for (i, row) in surface.rows().iter().enumerate() {
+            let text: String = row.segments.iter().map(|s| s.content.as_ref()).collect();
+            eprintln!("{i:2}|{text}");
+        }
+    }
+
+    #[test]
+    fn _dbg_task_list_dump() {
+        let src = "- [ ] todo with a fairly long wrapping label here\n\
+- [x] done\n\
+  - [ ] nested unchecked\n\
+  - [x] nested checked\n";
+        let blocks = crate::parser::parse(src);
+        let theme = crate::MarkdownTheme::default();
+        let surface = crate::render::render_blocks_to_surface(&blocks, 36, &theme);
+        eprintln!("--- task list render ---");
+        for (i, row) in surface.rows().iter().enumerate() {
+            let text: String = row.segments.iter().map(|s| s.content.as_ref()).collect();
+            eprintln!("{i:2}|{text}|");
+        }
+    }
+
+    #[test]
+    fn _dbg_mermaid_decision_shape() {
+        let src = "flowchart TD\n    A[Start] --> B{Ready?}\n    B -->|yes| C[Go]";
+        match crate::mermaid::render(src) {
+            Some(out) => {
+                eprintln!("--- mmdflux decision render ---");
+                for (i, line) in out.lines().enumerate() {
+                    eprintln!("{i:2}|{line}");
+                }
+            }
+            None => eprintln!("mermaid::render returned None"),
+        }
     }
 }

@@ -13,6 +13,10 @@ use std::pin::Pin;
 use std::rc::Rc;
 use std::task::{Context, Poll};
 
+use crate::reactive::{
+    NodeHandle, RootHandle, create_root, on_cleanup, provide_context, use_context,
+    use_current_scope,
+};
 use crossterm::cursor::{Hide, Show};
 use crossterm::event::{
     DisableMouseCapture, EnableMouseCapture, Event as CrosstermEvent, EventStream, KeyCode,
@@ -26,10 +30,6 @@ use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
 use futures::future::LocalBoxFuture;
 use futures::stream::{FusedStream, FuturesUnordered};
 use futures::{FutureExt as _, StreamExt as _, select};
-use crate::reactive::{
-    NodeHandle, RootHandle, create_root, on_cleanup, provide_context, use_context,
-    use_current_scope,
-};
 
 use crate::canvas::{Canvas, Rect};
 use crate::events::{Event, EventKind};
@@ -320,10 +320,18 @@ fn diff_and_draw<W: Write>(w: &mut W, prev: &Canvas, next: &Canvas) -> io::Resul
                     text_style = crate::text::SpanStyle::default();
                 }
                 if ch.style.fg != text_style.fg {
-                    write!(w, "{}", SetForegroundColor(ch.style.fg.unwrap_or(Color::Reset)))?;
+                    write!(
+                        w,
+                        "{}",
+                        SetForegroundColor(ch.style.fg.unwrap_or(Color::Reset))
+                    )?;
                 }
                 if ch.style.bg != text_style.bg {
-                    write!(w, "{}", SetBackgroundColor(ch.style.bg.unwrap_or(Color::Reset)))?;
+                    write!(
+                        w,
+                        "{}",
+                        SetBackgroundColor(ch.style.bg.unwrap_or(Color::Reset))
+                    )?;
                 }
                 let newly_on = ch.style.add_modifier & !text_style.add_modifier;
                 for attr in crate::canvas::modifier_attributes(newly_on) {
@@ -578,9 +586,9 @@ mod tests {
     use super::*;
     use crate::attributes::{GlobalAttributes, GlobalAttributesExt};
     use crate::canvas::{Canvas, Rect};
-    use crate::text::SpanStyle;
     use crate::components::tags;
     use crate::layout::render as render_buffer;
+    use crate::text::SpanStyle;
     use crate::view::View;
     use crate::{Color, bind, events};
 
@@ -828,7 +836,12 @@ mod tests {
                 .gap(1)
                 .border_style(BorderStyle::Single)
                 .children(vec![
-                    View::from(tags::p().color(Color::Cyan).children("Count: ").children(count)),
+                    View::from(
+                        tags::p()
+                            .color(Color::Cyan)
+                            .children("Count: ")
+                            .children(count),
+                    ),
                     View::from(
                         tags::div()
                             .flex_direction(FlexDirection::Row)
@@ -852,8 +865,14 @@ mod tests {
             painted.contains("[ - ]"),
             "button chrome should not be clipped: {painted}"
         );
-        assert!(painted.contains('┌'), "top-left border corner drawn: {painted}");
-        assert!(painted.contains('┐'), "top-right border corner drawn: {painted}");
+        assert!(
+            painted.contains('┌'),
+            "top-left border corner drawn: {painted}"
+        );
+        assert!(
+            painted.contains('┐'),
+            "top-right border corner drawn: {painted}"
+        );
         root.dispose();
     }
 

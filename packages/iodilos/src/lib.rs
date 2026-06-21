@@ -21,6 +21,7 @@ pub mod noderef;
 pub mod reactive;
 pub mod render;
 pub mod style;
+pub mod surface;
 pub mod text;
 pub mod view;
 
@@ -30,8 +31,8 @@ pub mod reactive_primitives {
 }
 
 pub use attributes::{Attributes, GlobalAttributes, GlobalAttributesExt, SetAttribute};
-pub use components::custom_element;
 pub use component::{Component, Props};
+pub use components::custom_element;
 pub use events::{Event, EventKind};
 pub use node::{AsTuiNode, NodeId, TuiNode};
 pub use noderef::NodeRef;
@@ -41,8 +42,9 @@ pub use style::{
     BorderCharacters, BorderStyle, Edges, FlexBasis, Gap, Inset, Margin, Padding, Percent, Size,
     Style, Weight,
 };
+pub use surface::{TextLayout, TextRow, TextSegment, TextSurface, VisualRow, VisualSegment};
+pub use text::{Alignment, Modifier, SpanStyle};
 pub use view::{View, ViewNode, ViewTuiNode};
-pub use text::{Alignment, Line, Modifier, Span, SpanStyle};
 
 /// The color type, re-exported from crossterm — the single point where the
 /// choice of paint backend dictates a public type (ADR-0024 §3).
@@ -55,9 +57,9 @@ pub use taffy::style::{
 
 /// The normal import surface for TUI applications.
 pub mod prelude {
-    pub use crossterm::style::Color;
     pub use crate::component::{Component, Props};
     pub use crate::reactive::*;
+    pub use crossterm::style::Color;
     pub use iodilos_macros::view;
     pub use taffy::style::{
         AlignContent, AlignItems, Display, FlexDirection, FlexWrap, JustifyContent, Overflow,
@@ -74,6 +76,8 @@ pub mod prelude {
         BorderCharacters, BorderStyle, Edges, FlexBasis, Gap, Inset, Margin, Padding, Percent,
         Size, Style, Weight,
     };
+    pub use crate::surface::{TextRow, TextSegment, TextSurface};
+    pub use crate::text::{Alignment, Modifier, SpanStyle};
     pub use crate::view::{View, ViewNode, ViewTuiNode};
     pub use crate::{bind, events};
 }

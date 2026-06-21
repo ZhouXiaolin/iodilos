@@ -212,7 +212,7 @@ impl Canvas {
 
     /// Paint one row of styled segments at row `y`, starting at column
     /// `rect.x`, clipping to `rect.width`. No wrapping — the caller has already
-    /// wrapped. Used by the `LineFlow` paint path.
+    /// wrapped. Used by the text-surface paint path.
     pub fn set_segments(&mut self, rect: Rect, y: u16, segments: &[(&str, SpanStyle)]) {
         if rect.width == 0 || y >= rect.bottom() {
             return;
@@ -314,17 +314,21 @@ fn emit_cell<W: Write>(
     text_style: &mut SpanStyle,
 ) -> io::Result<()> {
     let needs_reset = match &cell.character {
-        Some(c) => !c.style.sub_modifier.is_empty()
-            || (c.style.fg.is_none() && text_style.fg.is_some())
-            || (c.style.bg.is_none() && text_style.bg.is_some())
-            || (c.style.underline_color.is_none() && text_style.underline_color.is_some())
-            || (c.style.add_modifier & !text_style.add_modifier).is_empty()
-                && !text_style.add_modifier.is_empty()
-                && c.style.add_modifier != text_style.add_modifier,
-        None => !text_style.add_modifier.is_empty()
-            || text_style.fg.is_some()
-            || text_style.bg.is_some()
-            || text_style.underline_color.is_some(),
+        Some(c) => {
+            !c.style.sub_modifier.is_empty()
+                || (c.style.fg.is_none() && text_style.fg.is_some())
+                || (c.style.bg.is_none() && text_style.bg.is_some())
+                || (c.style.underline_color.is_none() && text_style.underline_color.is_some())
+                || (c.style.add_modifier & !text_style.add_modifier).is_empty()
+                    && !text_style.add_modifier.is_empty()
+                    && c.style.add_modifier != text_style.add_modifier
+        }
+        None => {
+            !text_style.add_modifier.is_empty()
+                || text_style.fg.is_some()
+                || text_style.bg.is_some()
+                || text_style.underline_color.is_some()
+        }
     };
     if needs_reset {
         write!(w, csi!("0m"))?;
@@ -411,9 +415,18 @@ mod tests {
         let mut canvas = Canvas::empty(Rect::new(0, 0, 3, 2));
         canvas.set_text(Rect::new(0, 0, 3, 2), "abcd", SpanStyle::default());
         // 'a','b','c' on row 0; 'd' wraps to row 1.
-        assert_eq!(canvas.cell(0, 0).unwrap().character.as_ref().unwrap().value, "a");
-        assert_eq!(canvas.cell(2, 0).unwrap().character.as_ref().unwrap().value, "c");
-        assert_eq!(canvas.cell(0, 1).unwrap().character.as_ref().unwrap().value, "d");
+        assert_eq!(
+            canvas.cell(0, 0).unwrap().character.as_ref().unwrap().value,
+            "a"
+        );
+        assert_eq!(
+            canvas.cell(2, 0).unwrap().character.as_ref().unwrap().value,
+            "c"
+        );
+        assert_eq!(
+            canvas.cell(0, 1).unwrap().character.as_ref().unwrap().value,
+            "d"
+        );
     }
 
     #[test]
@@ -475,14 +488,34 @@ mod tests {
             ),
         ];
         canvas.set_segments(Rect::new(0, 0, 5, 1), 0, segs);
-        assert_eq!(canvas.cell(0, 0).unwrap().character.as_ref().unwrap().value, "a");
-        assert_eq!(canvas.cell(2, 0).unwrap().character.as_ref().unwrap().value, "c");
         assert_eq!(
-            canvas.cell(2, 0).unwrap().character.as_ref().unwrap().style.fg,
+            canvas.cell(0, 0).unwrap().character.as_ref().unwrap().value,
+            "a"
+        );
+        assert_eq!(
+            canvas.cell(2, 0).unwrap().character.as_ref().unwrap().value,
+            "c"
+        );
+        assert_eq!(
+            canvas
+                .cell(2, 0)
+                .unwrap()
+                .character
+                .as_ref()
+                .unwrap()
+                .style
+                .fg,
             Some(Color::Red)
         );
         assert_eq!(
-            canvas.cell(0, 0).unwrap().character.as_ref().unwrap().style.fg,
+            canvas
+                .cell(0, 0)
+                .unwrap()
+                .character
+                .as_ref()
+                .unwrap()
+                .style
+                .fg,
             None
         );
     }

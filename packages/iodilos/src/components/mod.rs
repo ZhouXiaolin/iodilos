@@ -78,12 +78,12 @@ impl_element!(input, Input, "input");
 
 /// Aggregate re-export of every tag constructor and wrapper type.
 pub mod tags {
+    pub use super::{Button, button};
     pub use super::{CustomElement, custom_element};
     pub use super::{Div, div};
-    pub use super::{Span, span};
-    pub use super::{P, p};
-    pub use super::{Button, button};
     pub use super::{Input, input};
+    pub use super::{P, p};
+    pub use super::{Span, span};
 }
 
 #[cfg(test)]
@@ -106,15 +106,11 @@ mod tests {
         assert_eq!(node.attribute_value("id").as_deref(), Some("save"));
         assert_eq!(element.children.len(), 1);
 
-        let TuiNode::LineFlow { lines, .. } = &element.children[0] else {
-            panic!("text child should now be a LineFlow node");
+        let TuiNode::TextSurface { surface, .. } = &element.children[0] else {
+            panic!("text child should now be a TextSurface node");
         };
-        let lines = lines.borrow();
-        assert_eq!(lines.len(), 1, "one Line for \"Save\"");
-        let mut s = String::new();
-        for span in &lines[0].spans {
-            s.push_str(span.content.as_ref());
-        }
-        assert_eq!(s, "Save");
+        let surface = surface.borrow();
+        assert_eq!(surface.row_count(), 1, "one row for \"Save\"");
+        assert_eq!(surface.plain_text(), "Save");
     }
 }

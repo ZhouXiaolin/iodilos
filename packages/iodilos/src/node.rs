@@ -11,7 +11,7 @@ use crate::reactive::create_effect;
 use crate::attributes::{BoolAttribute, StringAttribute};
 use crate::events::Event;
 use crate::style::Style;
-use crate::text::Line;
+use crate::surface::TextSurface;
 use crate::view::{View, ViewNode, ViewTuiNode};
 
 static NEXT_NODE_ID: AtomicU64 = AtomicU64::new(1);
@@ -74,13 +74,13 @@ pub enum TuiNode {
         id: NodeId,
         view: Rc<RefCell<View<TuiNode>>>,
     },
-    /// A flat line-buffer text leaf. Holds an arbitrary number of styled lines
-    /// plus a scroll offset (rows). Laid out by taffy as a single leaf; painted
-    /// only across the visible `[offset, offset+rect.height)` rows.
-    LineFlow {
+    /// A text surface leaf. Components produce a logical `TextSurface`; taffy
+    /// supplies a rect; the surface module shapes it into visual rows for the
+    /// canvas.
+    TextSurface {
         id: NodeId,
-        lines: Rc<RefCell<Vec<Line>>>,
-        offset: Rc<RefCell<i32>>,
+        surface: Rc<RefCell<TextSurface>>,
+        scroll: Rc<RefCell<i32>>,
     },
 }
 
@@ -90,7 +90,7 @@ impl TuiNode {
             TuiNode::Element(element) => element.id,
             TuiNode::Marker { id }
             | TuiNode::Dynamic { id, .. }
-            | TuiNode::LineFlow { id, .. } => *id,
+            | TuiNode::TextSurface { id, .. } => *id,
         }
     }
 
@@ -144,13 +144,7 @@ impl TuiNode {
                 }
             }
             TuiNode::Marker { .. } => {}
-            TuiNode::LineFlow { lines, .. } => {
-                for line in lines.borrow().iter() {
-                    for span in &line.spans {
-                        out.push_str(span.content.as_ref());
-                    }
-                }
-            }
+            TuiNode::TextSurface { surface, .. } => out.push_str(&surface.borrow().plain_text()),
         }
     }
 
@@ -206,8 +200,8 @@ impl std::fmt::Debug for TuiNode {
                 .debug_struct("Dynamic")
                 .field("id", id)
                 .finish_non_exhaustive(),
-            TuiNode::LineFlow { id, .. } => f
-                .debug_struct("LineFlow")
+            TuiNode::TextSurface { id, .. } => f
+                .debug_struct("TextSurface")
                 .field("id", id)
                 .finish_non_exhaustive(),
         }
@@ -232,21 +226,21 @@ impl ViewNode for TuiNode {
         mut f: impl FnMut() -> U + 'static,
     ) -> View<Self> {
         if TypeId::of::<U>() == TypeId::of::<String>() {
-            let lines = Rc::new(RefCell::new(Vec::<crate::text::Line>::new()));
+            let surface = Rc::new(RefCell::new(TextSurface::new()));
             create_effect({
-                let lines = Rc::clone(&lines);
+                let surface = Rc::clone(&surface);
                 move || {
                     let mut value = Some(f());
                     let value: &mut Option<String> =
                         (&mut value as &mut dyn Any).downcast_mut().unwrap();
                     let s = value.take().unwrap();
-                    *lines.borrow_mut() = vec![crate::text::Line::raw(s)];
+                    *surface.borrow_mut() = TextSurface::from_text(s);
                 }
             });
-            View::from(TuiNode::LineFlow {
+            View::from(TuiNode::TextSurface {
                 id: NodeId::next(),
-                lines,
-                offset: Rc::new(RefCell::new(0)),
+                surface,
+                scroll: Rc::new(RefCell::new(0)),
             })
         } else {
             let view = Rc::new(RefCell::new(View::new()));
@@ -282,18 +276,18 @@ impl ViewTuiNode for TuiNode {
     }
 
     fn create_text_node(text: Cow<'static, str>) -> Self {
-        Self::create_line_flow_node(vec![crate::text::Line::raw(text)], 0)
+        Self::create_text_surface_node(TextSurface::from_text(text), 0)
     }
 
     fn create_marker_node() -> Self {
         Self::Marker { id: NodeId::next() }
     }
 
-    fn create_line_flow_node(lines: Vec<crate::text::Line>, offset: i32) -> Self {
-        Self::LineFlow {
+    fn create_text_surface_node(surface: TextSurface, scroll: i32) -> Self {
+        Self::TextSurface {
             id: NodeId::next(),
-            lines: Rc::new(RefCell::new(lines)),
-            offset: Rc::new(RefCell::new(offset)),
+            surface: Rc::new(RefCell::new(surface)),
+            scroll: Rc::new(RefCell::new(scroll)),
         }
     }
 }
@@ -314,40 +308,35 @@ mod tests {
     use super::*;
 
     #[test]
-    fn lineflow_node_holds_lines_and_offset() {
-        let lines = Rc::new(RefCell::new(vec![
-            crate::text::Line::raw("hello"),
-        ]));
-        let offset = Rc::new(RefCell::new(0i32));
-        let node = TuiNode::LineFlow {
+    fn text_surface_node_holds_surface_and_scroll() {
+        let surface = Rc::new(RefCell::new(TextSurface::from_text("hello")));
+        let scroll = Rc::new(RefCell::new(0i32));
+        let node = TuiNode::TextSurface {
             id: NodeId::next(),
-            lines: lines.clone(),
-            offset: offset.clone(),
+            surface: surface.clone(),
+            scroll: scroll.clone(),
         };
-        // collect_text reads the current lines.
         let mut s = String::new();
         node.collect_text(&mut s);
         assert_eq!(s, "hello");
-        // offset is readable and mutable through the shared cell.
-        assert_eq!(*offset.borrow(), 0);
-        *offset.borrow_mut() = 3;
-        assert_eq!(*offset.borrow(), 3);
+        assert_eq!(*scroll.borrow(), 0);
+        *scroll.borrow_mut() = 3;
+        assert_eq!(*scroll.borrow(), 3);
     }
 
     #[test]
-    fn dynamic_string_becomes_lineflow_that_updates() {
+    fn dynamic_string_becomes_text_surface_that_updates() {
         use crate::reactive::create_root;
         use crate::view::View;
         let root = create_root(|| {
             let sig = crate::reactive::create_signal("a".to_string());
             let view: View = (move || sig.get_clone()).into();
-            // The dynamic node is a LineFlow whose lines track the signal.
             let node = &view.nodes()[0];
-            let line_count = match node {
-                TuiNode::LineFlow { lines, .. } => lines.borrow().len(),
-                _ => panic!("expected LineFlow, got {node:?}"),
+            let row_count = match node {
+                TuiNode::TextSurface { surface, .. } => surface.borrow().row_count(),
+                _ => panic!("expected TextSurface, got {node:?}"),
             };
-            assert_eq!(line_count, 1, "one line for \"a\"");
+            assert_eq!(row_count, 1, "one row for \"a\"");
         });
         root.dispose();
     }

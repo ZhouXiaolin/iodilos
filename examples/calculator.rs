@@ -208,11 +208,16 @@ impl CalculatorActions {
 }
 
 fn has_trailing_operator(expr: &str) -> bool {
-    matches!(expr.chars().last(), Some('+') | Some('-') | Some('×') | Some('÷'))
+    matches!(
+        expr.chars().last(),
+        Some('+') | Some('-') | Some('×') | Some('÷')
+    )
 }
 
 fn current_number_has_decimal(expr: &str) -> bool {
-    expr.rsplit(['+', '-', '×', '÷']).next().is_some_and(|n| n.contains('.'))
+    expr.rsplit(['+', '-', '×', '÷'])
+        .next()
+        .is_some_and(|n| n.contains('.'))
 }
 
 fn screen(content: ReadSignal<String>, theme: ReadSignal<Theme>) -> View {
@@ -235,7 +240,11 @@ fn screen(content: ReadSignal<String>, theme: ReadSignal<Theme>) -> View {
     }
 }
 
-fn calc_button(label: &'static str, style: ButtonStyle, on_click: impl FnMut(Event) + 'static) -> View {
+fn calc_button(
+    label: &'static str,
+    style: ButtonStyle,
+    on_click: impl FnMut(Event) + 'static,
+) -> View {
     view! {
         button(
             on:click=on_click,

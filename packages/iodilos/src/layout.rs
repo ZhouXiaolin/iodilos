@@ -10,12 +10,12 @@ use std::collections::HashMap;
 
 use taffy::prelude::{AvailableSpace, Dimension, FlexDirection, Size};
 use taffy::{NodeId as TaffyNodeId, TaffyTree};
-use unicode_width::UnicodeWidthStr;
 
 use crate::attributes::resolve_style;
 use crate::canvas::{Canvas, Rect};
 use crate::node::{NodeId, TuiNode};
 use crate::style::{Edges, Style};
+use crate::surface::TextSurface;
 use crate::text::SpanStyle;
 
 #[derive(Debug, Clone)]
@@ -90,29 +90,23 @@ struct BuiltNode {
     taffy_id: TaffyNodeId,
     parent: Option<NodeId>,
     tag: Option<String>,
-    text: String,
     style: Style,
     focusable: bool,
-    text_leaf: bool,
     children: Vec<BuiltNode>,
-    line_flow: Option<(Vec<crate::text::Line>, i32)>,
+    surface: Option<(TextSurface, i32)>,
 }
 
 #[derive(Debug, Clone)]
 enum Measure {
-    Text { text: String },
-    Lines { lines: Vec<crate::text::Line> },
+    Surface { surface: TextSurface },
 }
 
 #[derive(Debug)]
 struct PaintNode {
-    tag: Option<String>,
     rect: PaintRect,
-    text: String,
     style: Style,
-    text_leaf: bool,
     children: Vec<PaintNode>,
-    line_flow: Option<(Vec<crate::text::Line>, i32)>,
+    surface: Option<(TextSurface, i32)>,
 }
 
 /// A rectangle in terminal-cell space, used inside the paint pipeline. Unlike
@@ -220,8 +214,7 @@ pub(crate) fn render(
         },
         |known, available, _node, context, _style| {
             context.map_or(Size::ZERO, |ctx| match ctx {
-                Measure::Text { text } => measure_text(text, known, available),
-                Measure::Lines { lines } => measure_lines(lines, known, available),
+                Measure::Surface { surface } => measure_surface(surface, known, available),
             })
         },
     );
@@ -250,26 +243,30 @@ fn build_node(
 ) -> Option<BuiltNode> {
     match node {
         TuiNode::Marker { .. } => None,
-        TuiNode::LineFlow { id, lines, offset } => {
-            let lines_snapshot = lines.borrow().clone();
-            let offset_value = *offset.borrow();
+        TuiNode::TextSurface {
+            id,
+            surface,
+            scroll,
+        } => {
+            let surface_snapshot = surface.borrow().clone();
+            let scroll_value = *scroll.borrow();
             let taffy_id = tree
                 .new_leaf_with_context(
                     taffy::style::Style::default(),
-                    Measure::Lines { lines: lines_snapshot.clone() },
+                    Measure::Surface {
+                        surface: surface_snapshot.clone(),
+                    },
                 )
-                .expect("create lineflow leaf");
+                .expect("create text surface leaf");
             Some(BuiltNode {
                 runtime_id: *id,
                 taffy_id,
                 parent,
                 tag: None,
-                text: String::new(),
                 style: Style::default(),
                 focusable: false,
-                text_leaf: false,
                 children: Vec::new(),
-                line_flow: Some((lines_snapshot, offset_value)),
+                surface: Some((surface_snapshot, scroll_value)),
             })
         }
         TuiNode::Dynamic { id, view } => {
@@ -291,36 +288,38 @@ fn build_node(
                 taffy_id,
                 parent,
                 tag: None,
-                text: String::new(),
                 style: Style::default(),
                 focusable: false,
-                text_leaf: false,
                 children,
-                line_flow: None,
+                surface: None,
             })
         }
         TuiNode::Element(element) => {
             let tag_name = element.tag.to_string();
             let style = resolve_style(&element.style_props, default_style_for_tag(&element.tag));
             let leaf = is_text_leaf(&element.tag, &element.children);
-            let text = element_text(node);
-            let display_text = display_text_for_tag(Some(&tag_name), &text).into_owned();
             let focusable = is_focusable(node);
             if leaf {
+                let text = element_text(node);
+                let display_text = display_text_for_tag(Some(&tag_name), &text).into_owned();
+                let surface = TextSurface::from_text(display_text);
                 let taffy_id = tree
-                    .new_leaf_with_context(style.to_taffy(), Measure::Text { text: display_text })
+                    .new_leaf_with_context(
+                        style.to_taffy(),
+                        Measure::Surface {
+                            surface: surface.clone(),
+                        },
+                    )
                     .expect("create element leaf");
                 Some(BuiltNode {
                     runtime_id: element.id,
                     taffy_id,
                     parent,
                     tag: Some(tag_name),
-                    text,
                     style,
                     focusable,
-                    text_leaf: true,
                     children: Vec::new(),
-                    line_flow: None,
+                    surface: Some((surface, 0)),
                 })
             } else {
                 let built_children = element
@@ -340,12 +339,10 @@ fn build_node(
                     taffy_id,
                     parent,
                     tag: Some(tag_name),
-                    text,
                     style,
                     focusable,
-                    text_leaf: false,
                     children: built_children,
-                    line_flow: None,
+                    surface: None,
                 })
             }
         }
@@ -381,13 +378,10 @@ fn extract_node(
         .map(|child| extract_node(tree, child, rect, index))
         .collect();
     PaintNode {
-        tag: built.tag.clone(),
         rect,
-        text: built.text.clone(),
         style: built.style.clone(),
-        text_leaf: built.text_leaf,
         children,
-        line_flow: built.line_flow.clone(),
+        surface: built.surface.clone(),
     }
 }
 
@@ -447,29 +441,25 @@ fn paint_node(
             );
         }
 
-        // Only leaf/inline tags emit text; containers delegate to their children.
-        if node.text_leaf {
-            let display_text = display_text_for_tag(node.tag.as_deref(), &node.text);
-            paint_text_clipped(canvas, node.rect, &display_text, text, clip);
-        }
-
-        if let Some((lines, offset)) = &node.line_flow {
-            let base = text;
+        if let Some((surface, scroll)) = &node.surface {
             let width = node.rect.width as usize;
-            let rows = wrap_lines(lines, width, base);
-            let offset = (*offset).max(0) as usize;
+            let layout = surface.layout(width, text);
+            let scroll = (*scroll).max(0) as usize;
             let visible_height = node.rect.height as usize;
             let clip_rect = intersect_rect(node.rect, clip).unwrap_or(PaintRect::ZERO);
-            for (i, row) in rows.iter().enumerate() {
-                if i < offset || i >= offset + visible_height {
+            for (i, row) in layout.rows().iter().enumerate() {
+                if i < scroll || i >= scroll + visible_height {
                     continue;
                 }
-                let y = node.rect.y + (i - offset) as i32;
+                let y = node.rect.y + (i - scroll) as i32;
                 if y < clip_rect.y || y >= clip_rect.bottom() {
                     continue;
                 }
-                let segs: Vec<(&str, SpanStyle)> =
-                    row.iter().map(|(s, st)| (s.as_str(), *st)).collect();
+                let segs: Vec<(&str, SpanStyle)> = row
+                    .segments
+                    .iter()
+                    .map(|segment| (segment.content.as_str(), segment.style))
+                    .collect();
                 canvas.set_segments(clip_rect.to_canvas_rect(), y as u16, &segs);
             }
         }
@@ -595,16 +585,6 @@ fn paint_border_clipped(
     }
 }
 
-fn paint_text_clipped(
-    canvas: &mut Canvas,
-    rect: PaintRect,
-    text: &str,
-    style: SpanStyle,
-    clip: PaintRect,
-) {
-    paint_text_clipped_raw(canvas, rect, text, style, clip);
-}
-
 fn paint_text_clipped_raw(
     canvas: &mut Canvas,
     rect: PaintRect,
@@ -683,90 +663,25 @@ fn intersect_rect(a: PaintRect, b: PaintRect) -> Option<PaintRect> {
     })
 }
 
-fn measure_text(
-    text: &str,
+fn measure_surface(
+    surface: &TextSurface,
     known: Size<Option<f32>>,
     available: Size<AvailableSpace>,
 ) -> Size<f32> {
-    let raw_width = text.lines().map(UnicodeWidthStr::width).max().unwrap_or(0) as f32;
+    let raw_width = surface.max_width() as f32;
     let available_width = match available.width {
-        AvailableSpace::Definite(width) => width.max(1.0),
+        AvailableSpace::Definite(w) => w.max(1.0),
         AvailableSpace::MinContent | AvailableSpace::MaxContent => raw_width.max(1.0),
     };
     let width = known
         .width
         .unwrap_or(raw_width.min(available_width).max(1.0));
     let height = known.height.unwrap_or_else(|| {
-        let lines = text.lines().count().max(1) as f32;
-        let wrapped = if width > 0.0 {
-            (raw_width / width).ceil().max(1.0)
-        } else {
-            1.0
-        };
-        lines.max(wrapped)
+        surface
+            .layout(width as usize, SpanStyle::default())
+            .height() as f32
     });
     Size { width, height }
-}
-
-/// Measure a `LineFlow`'s lines: width is the longest raw line (capped at the
-/// available width), height is the wrapped row count.
-fn measure_lines(
-    lines: &[crate::text::Line],
-    known: Size<Option<f32>>,
-    available: Size<AvailableSpace>,
-) -> Size<f32> {
-    let raw_width = lines.iter().map(|l| l.width() as f32).fold(0.0_f32, f32::max);
-    let available_width = match available.width {
-        AvailableSpace::Definite(w) => w.max(1.0),
-        AvailableSpace::MinContent | AvailableSpace::MaxContent => raw_width.max(1.0),
-    };
-    let width = known.width.unwrap_or(raw_width.min(available_width).max(1.0));
-    let height = known.height.unwrap_or_else(|| {
-        wrap_lines(lines, width as usize, SpanStyle::default()).len() as f32
-    });
-    Size { width, height }
-}
-
-/// Wrap `lines` at `width` cells into physical rows. Each output row is a list
-/// of `(grapheme_string, resolved_style)` pairs, where the resolved style is
-/// `base.patch(line.style).patch(span.style)`. Shared by measure (row count)
-/// and paint (draw) so they agree on where breaks fall. Character-level breaks
-/// (no word-boundary preference) — sufficient for Plan 1; Plan 3 may refine.
-fn wrap_lines(
-    lines: &[crate::text::Line],
-    width: usize,
-    base: SpanStyle,
-) -> Vec<Vec<(String, SpanStyle)>> {
-    use unicode_width::UnicodeWidthChar;
-    let width = width.max(1);
-    let mut rows: Vec<Vec<(String, SpanStyle)>> = Vec::new();
-    for line in lines {
-        let line_base = base.patch(line.style);
-        let mut row: Vec<(String, SpanStyle)> = Vec::new();
-        let mut col = 0usize;
-        for span in &line.spans {
-            let resolved = line_base.patch(span.style);
-            for ch in span.content.chars() {
-                if ch == '\n' {
-                    rows.push(std::mem::take(&mut row));
-                    col = 0;
-                    continue;
-                }
-                let cw = UnicodeWidthChar::width(ch).unwrap_or(0).max(1);
-                if col + cw > width && !row.is_empty() {
-                    rows.push(std::mem::take(&mut row));
-                    col = 0;
-                }
-                row.push((ch.to_string(), resolved));
-                col += cw;
-            }
-        }
-        rows.push(row);
-    }
-    if rows.is_empty() {
-        rows.push(Vec::new());
-    }
-    rows
 }
 
 fn rect_from_layout(layout: &taffy::Layout, parent_rect: PaintRect) -> PaintRect {
@@ -801,9 +716,9 @@ fn default_style_for_tag(tag: &str) -> Style {
 fn is_text_leaf(tag: &str, children: &[TuiNode]) -> bool {
     matches!(tag, "span" | "p" | "input")
         || (tag == "button"
-            && children.iter().all(|child| {
-                matches!(child, TuiNode::LineFlow { .. } | TuiNode::Marker { .. })
-            }))
+            && children
+                .iter()
+                .all(|child| matches!(child, TuiNode::TextSurface { .. } | TuiNode::Marker { .. })))
 }
 
 fn element_text(node: &TuiNode) -> String {
@@ -1066,7 +981,10 @@ mod tests {
         let seven = seven.expect("button child text should paint");
 
         assert!(
-            !seven.style.add_modifier.contains(crate::text::Modifier::REVERSED),
+            !seven
+                .style
+                .add_modifier
+                .contains(crate::text::Modifier::REVERSED),
             "focus should not force reversed-video text"
         );
         root.dispose();
@@ -1148,49 +1066,61 @@ mod tests {
     }
 
     #[test]
-    fn wrap_lines_breaks_at_width() {
-        use crate::text::{Line, Span, SpanStyle};
-        let lines = vec![Line::from(Span::raw("abcdef"))]; // width 6
-        let rows = wrap_lines(
-            &lines,
-            3,
-            SpanStyle::default(),
+    fn text_surface_layout_breaks_at_width() {
+        use crate::surface::{TextRow, TextSegment, TextSurface};
+
+        let surface = TextSurface::from_row(TextRow::from(TextSegment::raw("abcdef")));
+        let layout = surface.layout(3, SpanStyle::default());
+
+        assert_eq!(layout.height(), 2);
+        assert_eq!(layout.rows()[0].segments[0].content, "a");
+        assert_eq!(layout.rows()[0].segments[1].content, "b");
+        assert_eq!(layout.rows()[0].segments[2].content, "c");
+        assert_eq!(layout.rows()[1].segments[0].content, "d");
+    }
+
+    #[test]
+    fn text_surface_layout_resolves_segment_style_patched_on_base() {
+        use crate::surface::{TextRow, TextSegment, TextSurface};
+        use crate::text::{Modifier, SpanStyle};
+
+        let surface = TextSurface::from_row(TextRow::from_segments(vec![
+            TextSegment::raw("a"),
+            TextSegment::styled(
+                "b",
+                SpanStyle {
+                    add_modifier: Modifier::BOLD,
+                    ..SpanStyle::default()
+                },
+            ),
+        ]));
+        let layout = surface.layout(10, SpanStyle::default());
+
+        assert_eq!(layout.height(), 1);
+        assert!(
+            !layout.rows()[0].segments[0]
+                .style
+                .add_modifier
+                .contains(Modifier::BOLD)
         );
-        // 6 chars at width 3 → 2 rows.
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0][0].0, "a");
-        assert_eq!(rows[0][1].0, "b");
-        assert_eq!(rows[0][2].0, "c");
-        assert_eq!(rows[1][0].0, "d");
+        assert!(
+            layout.rows()[0].segments[1]
+                .style
+                .add_modifier
+                .contains(Modifier::BOLD)
+        );
     }
 
     #[test]
-    fn wrap_lines_resolves_per_span_style_patched_on_base() {
-        use crate::text::{Line, Span, SpanStyle, Modifier};
-        let line = Line::from(vec![
-            Span::raw("a"),
-            Span::styled("b", SpanStyle {
-                add_modifier: Modifier::BOLD,
-                ..SpanStyle::default()
-            }),
-        ]);
-        let rows = wrap_lines(&[line], 10, SpanStyle::default());
-        assert_eq!(rows.len(), 1);
-        // First grapheme unstyled, second carries BOLD.
-        assert!(!rows[0][0].1.add_modifier.contains(Modifier::BOLD));
-        assert!(rows[0][1].1.add_modifier.contains(Modifier::BOLD));
-    }
-
-    #[test]
-    fn lineflow_measures_wrapped_height() {
-        use crate::text::{Line, Span};
+    fn text_surface_measures_wrapped_height() {
+        use crate::surface::{TextRow, TextSegment, TextSurface};
         use crate::view::ViewTuiNode;
         let mut nodes = Vec::new();
         let root = crate::reactive::create_root(|| {
             let view: View = tags::div()
                 .width(3)
-                .children(View::from_node(TuiNode::create_line_flow_node(
-                    vec![Line::from(Span::raw("abcdef"))],
+                .children(View::from_node(TuiNode::create_text_surface_node(
+                    TextSurface::from_row(TextRow::from(TextSegment::raw("abcdef"))),
                     0,
                 )))
                 .into();
@@ -1201,24 +1131,24 @@ mod tests {
     }
 
     #[test]
-    fn lineflow_paints_offset_window_only() {
-        use crate::text::{Line, Span};
+    fn text_surface_paints_scroll_window_only() {
+        use crate::surface::{TextRow, TextSurface};
         use crate::view::ViewTuiNode;
         let mut nodes = Vec::new();
         let root = crate::reactive::create_root(|| {
-            let lines: Vec<Line> = vec![
-                Line::from(Span::raw("a")),
-                Line::from(Span::raw("b")),
-                Line::from(Span::raw("c")),
-                Line::from(Span::raw("d")),
-                Line::from(Span::raw("e")),
-            ];
-            let lf = TuiNode::create_line_flow_node(lines, 1);
+            let surface = TextSurface::from_rows(vec![
+                TextRow::raw("a"),
+                TextRow::raw("b"),
+                TextRow::raw("c"),
+                TextRow::raw("d"),
+                TextRow::raw("e"),
+            ]);
+            let leaf = TuiNode::create_text_surface_node(surface, 1);
             let view: View = tags::div()
                 .width(5)
                 .height(2)
                 .overflow(taffy::style::Overflow::Hidden)
-                .children(View::from_node(lf))
+                .children(View::from_node(leaf))
                 .into();
             nodes = view.nodes.into_iter().collect();
         });
@@ -1226,31 +1156,38 @@ mod tests {
         let painted = canvas_to_plain_text(&canvas);
         assert!(painted.contains('b'), "offset row 0 visible: {painted}");
         assert!(painted.contains('c'), "offset row 1 visible: {painted}");
-        assert!(!painted.contains('a'), "scrolled-off head clipped: {painted}");
+        assert!(
+            !painted.contains('a'),
+            "scrolled-off head clipped: {painted}"
+        );
         assert!(!painted.contains('d'), "below viewport clipped: {painted}");
         root.dispose();
     }
 
     #[test]
-    fn lineflow_paints_per_span_styles() {
-        use crate::text::{Line, Span, SpanStyle};
+    fn text_surface_paints_per_segment_styles() {
+        use crate::surface::{TextRow, TextSegment};
+        use crate::text::SpanStyle;
         let mut nodes = Vec::new();
         let root = crate::reactive::create_root(|| {
-            let line = Line::from(vec![
-                Span::raw("plain "),
-                Span::styled("bold", SpanStyle {
-                    add_modifier: crate::text::Modifier::BOLD,
-                    ..SpanStyle::default()
-                }),
-                Span::styled(" red", SpanStyle {
-                    fg: Some(crate::Color::Red),
-                    ..SpanStyle::default()
-                }),
+            let row = TextRow::from_segments(vec![
+                TextSegment::raw("plain "),
+                TextSegment::styled(
+                    "bold",
+                    SpanStyle {
+                        add_modifier: crate::text::Modifier::BOLD,
+                        ..SpanStyle::default()
+                    },
+                ),
+                TextSegment::styled(
+                    " red",
+                    SpanStyle {
+                        fg: Some(crate::Color::Red),
+                        ..SpanStyle::default()
+                    },
+                ),
             ]);
-            let view: View = tags::div()
-                .width(20)
-                .children(View::from(line))
-                .into();
+            let view: View = tags::div().width(20).children(View::from(row)).into();
             nodes = view.nodes.into_iter().collect();
         });
         let (canvas, _index) = render(&nodes, Rect::new(0, 0, 20, 1), None);
@@ -1259,8 +1196,18 @@ mod tests {
         let bold_cell = canvas.cell(6, 0).unwrap().character.as_ref().unwrap();
         let red_cell = canvas.cell(10, 0).unwrap().character.as_ref().unwrap();
         assert_eq!(plain_cell.value, "p");
-        assert!(!plain_cell.style.add_modifier.contains(crate::text::Modifier::BOLD));
-        assert!(bold_cell.style.add_modifier.contains(crate::text::Modifier::BOLD));
+        assert!(
+            !plain_cell
+                .style
+                .add_modifier
+                .contains(crate::text::Modifier::BOLD)
+        );
+        assert!(
+            bold_cell
+                .style
+                .add_modifier
+                .contains(crate::text::Modifier::BOLD)
+        );
         assert_eq!(red_cell.style.fg, Some(crate::Color::Red));
         root.dispose();
     }
@@ -1280,28 +1227,30 @@ mod tests {
         let (canvas, _index) = render(&nodes, Rect::new(0, 0, 1, 1), None);
         let cell = canvas.cell(0, 0).unwrap().character.as_ref().unwrap();
         assert!(cell.style.add_modifier.contains(crate::text::Modifier::DIM));
-        assert!(cell.style.add_modifier.contains(crate::text::Modifier::CROSSED_OUT));
+        assert!(
+            cell.style
+                .add_modifier
+                .contains(crate::text::Modifier::CROSSED_OUT)
+        );
         root.dispose();
     }
 
     #[test]
-    fn lineflow_wrap_carries_style_across_break() {
-        use crate::text::{Line, Span, SpanStyle, Modifier};
+    fn text_surface_wrap_carries_style_across_break() {
+        use crate::surface::{TextRow, TextSegment};
+        use crate::text::{Modifier, SpanStyle};
         // One span "ABCDEF" styled BOLD, width 3 → two rows "ABC" / "DEF".
         // Both rows' graphemes must carry BOLD.
         let mut nodes = Vec::new();
         let root = crate::reactive::create_root(|| {
-            let line = Line::from(vec![Span::styled(
+            let row = TextRow::from_segments(vec![TextSegment::styled(
                 "ABCDEF",
                 SpanStyle {
                     add_modifier: Modifier::BOLD,
                     ..SpanStyle::default()
                 },
             )]);
-            let view: View = tags::div()
-                .width(3)
-                .children(View::from(line))
-                .into();
+            let view: View = tags::div().width(3).children(View::from(row)).into();
             nodes = view.nodes.into_iter().collect();
         });
         let (canvas, _index) = render(&nodes, Rect::new(0, 0, 3, 2), None);
@@ -1319,18 +1268,21 @@ mod tests {
     }
 
     #[test]
-    fn element_with_lineflow_child_is_text_leaf() {
-        use crate::text::Line;
+    fn element_with_text_surface_child_is_text_leaf() {
+        use crate::surface::TextSurface;
         let mut nodes = Vec::new();
         let root = crate::reactive::create_root(|| {
             let view: View = tags::button()
-                .children(View::from(Line::raw("hi")))
+                .children(View::from(TextSurface::from_text("hi")))
                 .into();
             nodes = view.nodes.into_iter().collect();
         });
         let (canvas, _index) = render(&nodes, Rect::new(0, 0, 10, 1), None);
         let painted = canvas_to_plain_text(&canvas);
-        assert!(painted.contains("[ hi ]"), "button chrome should paint: {painted}");
+        assert!(
+            painted.contains("[ hi ]"),
+            "button chrome should paint: {painted}"
+        );
         root.dispose();
     }
 }

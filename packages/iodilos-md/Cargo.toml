@@ -17,6 +17,11 @@ iodilos = { path = "../iodilos" }
 crossterm = "0.29"
 pulldown-cmark = { version = "0.12", default-features = false, features = ["simd"] }
 unicode-width = "0.2"
+# LaTeX → Unicode conversion (`\frac`/`\sqrt`/`^{}`/`_{}` …) for math, mirroring
+# leaf's `latex.rs`.
+unicodeit = "0.2"
+# Mermaid → terminal text rendering for fenced flowcharts, mirroring leaf.
+mmdflux = "2.5"
 # `default-syntaxes`/`default-themes` ship the grammar + theme sets; `parsing`
 # enables the parser; `default-fancy` is the pure-Rust regex engine (no onig
 # system dep). All under `default-features = false` to stay lean.

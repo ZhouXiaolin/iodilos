@@ -1,11 +1,8 @@
-//! ratatui-style text primitives: `SpanStyle`, `Modifier`, `Alignment`,
-//! `Span`, `Line` — the content model for `TuiNode::LineFlow`.
+//! Terminal text styling primitives used by the surface painter.
 //!
-//! Structurally aligned with `ratatui-core` 0.1.1 (so `iodilos-md` can mirror
-//! `~/leaf`), but self-built — no ratatui dependency (ADR-0024). Color stays
-//! `crossterm::style::Color` (ADR-0024 §3).
-
-use std::borrow::Cow;
+//! These types intentionally mirror ratatui's style semantics where useful, but
+//! they are not the document model. `surface` owns the row/segment abstraction
+//! that components paint through.
 
 use bitflags::bitflags;
 use crossterm::style::Color;
@@ -62,8 +59,7 @@ impl SpanStyle {
     }
 }
 
-/// Horizontal alignment of a [`Line`] within its area. Mirrors
-/// `ratatui_core::layout::Alignment`.
+/// Horizontal alignment of a surface row within its area.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Alignment {
     /// Left-aligned (the default).
@@ -73,111 +69,6 @@ pub enum Alignment {
     Center,
     /// Right-aligned.
     Right,
-}
-
-/// A styled run of text: the smallest styleable unit. Mirrors
-/// `ratatui_core::text::Span` but `'static` (a `TuiNode` outlives any borrow).
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Span {
-    /// The style of this span.
-    pub style: SpanStyle,
-    /// The content as a clone-on-write static string.
-    pub content: Cow<'static, str>,
-}
-
-impl Span {
-    /// A span with the default (unset) style.
-    pub fn raw<T: Into<Cow<'static, str>>>(content: T) -> Self {
-        Self {
-            style: SpanStyle::default(),
-            content: content.into(),
-        }
-    }
-
-    /// A span with the given style.
-    pub fn styled<T: Into<Cow<'static, str>>>(content: T, style: SpanStyle) -> Self {
-        Self {
-            style,
-            content: content.into(),
-        }
-    }
-
-    /// Unicode display width of this span's content.
-    pub fn width(&self) -> usize {
-        unicode_width::UnicodeWidthStr::width(self.content.as_ref())
-    }
-}
-
-impl From<&'static str> for Span {
-    fn from(s: &'static str) -> Self {
-        Span::raw(s)
-    }
-}
-
-impl From<String> for Span {
-    fn from(s: String) -> Self {
-        Span::raw(s)
-    }
-}
-
-/// A line of text: one or more [`Span`]s, an optional line-wide style
-/// (patched onto each span during paint), and an optional alignment. Mirrors
-/// `ratatui_core::text::Line`.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Line {
-    /// A style applied to every span in the line (patched under each span's own).
-    pub style: SpanStyle,
-    /// Optional alignment within the available width.
-    pub alignment: Option<Alignment>,
-    /// The spans making up this line.
-    pub spans: Vec<Span>,
-}
-
-impl Line {
-    /// A line with a single unstyled span.
-    pub fn raw<T: Into<Cow<'static, str>>>(content: T) -> Self {
-        Self {
-            spans: vec![Span::raw(content)],
-            ..Default::default()
-        }
-    }
-
-    /// A line with a single span carrying `style` (line-wide style stays unset).
-    pub fn styled<T: Into<Cow<'static, str>>>(content: T, style: SpanStyle) -> Self {
-        Self {
-            spans: vec![Span::styled(content, style)],
-            ..Default::default()
-        }
-    }
-
-    /// Unicode display width (sum of span widths).
-    pub fn width(&self) -> usize {
-        self.spans.iter().map(|s| s.width()).sum()
-    }
-}
-
-impl From<Span> for Line {
-    fn from(s: Span) -> Self {
-        Self {
-            spans: vec![s],
-            ..Default::default()
-        }
-    }
-}
-
-impl From<Vec<Span>> for Line {
-    fn from(spans: Vec<Span>) -> Self {
-        Self {
-            spans,
-            ..Default::default()
-        }
-    }
-}
-
-impl From<&'static str> for Line {
-    fn from(s: &'static str) -> Self {
-        Line::raw(s)
-    }
 }
 
 #[cfg(test)]
@@ -223,38 +114,5 @@ mod tests {
     #[test]
     fn alignment_default_is_left() {
         assert_eq!(Alignment::default(), Alignment::Left);
-    }
-
-    #[test]
-    fn span_raw_has_no_style() {
-        let s = Span::raw("hi");
-        assert_eq!(s.content, Cow::Borrowed("hi"));
-        assert_eq!(s.style, SpanStyle::default());
-    }
-
-    #[test]
-    fn span_width_counts_unicode() {
-        assert_eq!(Span::raw("abc").width(), 3);
-        // CJK fullwidth chars are width 2 each.
-        assert_eq!(Span::raw("你好").width(), 4);
-    }
-
-    #[test]
-    fn line_raw_is_single_unstyled_span() {
-        let l = Line::raw("hello");
-        assert_eq!(l.spans.len(), 1);
-        assert_eq!(l.style, SpanStyle::default());
-        assert_eq!(l.width(), 5);
-    }
-
-    #[test]
-    fn line_from_spans_preserves_order() {
-        let l: Line = vec![
-            Span::styled("a", SpanStyle::new()),
-            Span::raw("b"),
-        ]
-        .into();
-        assert_eq!(l.spans.len(), 2);
-        assert_eq!(l.spans[0].content, Cow::Borrowed("a"));
     }
 }

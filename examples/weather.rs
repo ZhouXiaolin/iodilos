@@ -1,8 +1,8 @@
 use std::time::Duration;
 
 use crossterm::event::{KeyCode, KeyEventKind};
-use serde::Deserialize;
 use iodilos::prelude::*;
+use serde::Deserialize;
 use tokio::sync::mpsc;
 use tokio::time::sleep;
 

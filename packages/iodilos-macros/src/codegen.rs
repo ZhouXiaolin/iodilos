@@ -1,8 +1,8 @@
 //! Codegen for the iodilos `view!` macro.
 
+use crate::ir::{DynNode, Node, Prop, PropType, Root, TagIdent, TagNode, TextNode};
 use proc_macro2::TokenStream;
 use quote::quote;
-use crate::ir::{DynNode, Node, Prop, PropType, Root, TagIdent, TagNode, TextNode};
 use syn::{Expr, Pat};
 
 macro_rules! rt {

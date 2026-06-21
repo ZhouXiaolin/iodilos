@@ -681,7 +681,6 @@ impl<T: RemAssign<Rhs>, Rhs> RemAssign<Rhs> for Signal<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::reactive::*;
 
     #[test]
     fn signal() {

@@ -225,7 +225,6 @@ impl<T> From<Vec<T>> for MaybeDyn<Vec<T>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::reactive::*;
 
     #[test]
     fn maybe_dyn_static() {

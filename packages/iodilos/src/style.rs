@@ -6,9 +6,9 @@
 //! are first-class rather than hidden behind a builder. The legacy aggregate
 //! `TuiStyle` and the `style()` builder are removed.
 
+use crate::text::{Modifier, SpanStyle};
 use bitflags::bitflags;
 use crossterm::style::Color;
-use crate::text::{Modifier, SpanStyle};
 // `MaybeDyn` must be in scope: `impl_into_maybe_dyn!` references the unqualified
 // type name in its expansion. Both are re-exported at the crate root (the macro
 // via `#[macro_export]`, the type via `pub use reactive::*`).
@@ -581,7 +581,7 @@ impl Style {
 
     /// The inheritable text-style portion of this style, as a `SpanStyle` (the
     /// single text-style type). Used by layout paint as the base onto which
-    /// each `Span`'s style patches.
+    /// each surface segment's style patches.
     pub(crate) fn text_span_style(&self) -> SpanStyle {
         let mut add = Modifier::empty();
         match self.weight {

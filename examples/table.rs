@@ -1,11 +1,7 @@
 use iodilos::prelude::*;
 
 fn row(id: i32, name: &'static str, email: &'static str, shaded: bool) -> View {
-    let bg = if shaded {
-        Some(Color::DarkGrey)
-    } else {
-        None
-    };
+    let bg = if shaded { Some(Color::DarkGrey) } else { None };
 
     view! {
         div(flex_direction = FlexDirection::Row, background_color = move || bg.unwrap_or(Color::Reset)) {

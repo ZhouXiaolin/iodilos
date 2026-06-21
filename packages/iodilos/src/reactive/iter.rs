@@ -278,7 +278,6 @@ mod tests {
     use std::rc::Rc;
 
     use super::*;
-    use crate::reactive::*;
 
     #[test]
     fn keyed() {

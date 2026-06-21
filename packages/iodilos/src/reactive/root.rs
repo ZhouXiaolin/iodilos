@@ -479,7 +479,6 @@ pub fn use_global_scope() -> NodeHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::reactive::*;
 
     #[test]
     fn test_lazy_vs_eager_updates() {

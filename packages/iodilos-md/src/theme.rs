@@ -5,7 +5,7 @@
 
 use crossterm::style::Color;
 
-/// A complete color palette for the markdown renderer ([`crate::markdown_lines`]
+/// A complete color palette for the markdown renderer ([`crate::markdown_surface`]
 /// / [`crate::render`]). All fields are plain `Color` values so a theme can be
 /// assembled with `const` constructors.
 #[derive(Clone, Copy, Debug)]
@@ -44,6 +44,26 @@ pub struct MarkdownTheme {
     pub math_bg: Color,
     /// Border color of the block-level math frame.
     pub math_border: Color,
+    /// Mermaid rendered text / fallback source color.
+    pub mermaid_text: Color,
+    /// Mermaid diagram keyword color in fallback source rendering.
+    pub mermaid_keyword: Color,
+    /// Mermaid arrow/operator color in fallback source rendering.
+    pub mermaid_arrow: Color,
+    /// Mermaid edge label color in fallback source rendering.
+    pub mermaid_label: Color,
+    /// Border color of Mermaid block frames.
+    pub mermaid_border: Color,
+    /// GFM alert accent color for `[!NOTE]`.
+    pub alert_note: Color,
+    /// GFM alert accent color for `[!TIP]`.
+    pub alert_tip: Color,
+    /// GFM alert accent color for `[!IMPORTANT]`.
+    pub alert_important: Color,
+    /// GFM alert accent color for `[!WARNING]`.
+    pub alert_warning: Color,
+    /// GFM alert accent color for `[!CAUTION]`.
+    pub alert_caution: Color,
 }
 
 impl MarkdownTheme {
@@ -74,6 +94,16 @@ impl MarkdownTheme {
             math_text: Color::Magenta,
             math_bg: Color::DarkGrey,
             math_border: Color::DarkGrey,
+            mermaid_text: Color::Cyan,
+            mermaid_keyword: Color::Yellow,
+            mermaid_arrow: Color::Green,
+            mermaid_label: Color::Magenta,
+            mermaid_border: Color::DarkGrey,
+            alert_note: Color::Blue,
+            alert_tip: Color::Green,
+            alert_important: Color::Magenta,
+            alert_warning: Color::Yellow,
+            alert_caution: Color::Red,
         }
     }
 }

@@ -1,9 +1,9 @@
-//! Streaming Markdown viewer demo (LineFlow edition).
+//! Streaming Markdown viewer demo (TextSurface edition).
 //!
 //! A fixed Markdown document is fed in character-by-character (simulating an
 //! LLM token stream). Each tick mutates a `Signal<String>`; a reactive memo
-//! re-renders the markdown into `Vec<Line>` at the terminal width and feeds a
-//! `LineFlow`. Scroll offset is a `Signal<i32>`; arrow keys / mouse wheel /
+//! re-renders the markdown into a `TextSurface` at the terminal width. Scroll
+//! offset is a `Signal<i32>`; arrow keys / mouse wheel /
 //! PgUp-PgDn change it; `F` toggles follow-the-tail.
 //!
 //! Keys: ↑/↓ scroll 1 line, PgUp/PgDn scroll a page, wheel scrolls, `F`
@@ -21,12 +21,13 @@ use tokio::time::sleep;
 const SAMPLE_MD: &str = "\
 # Streaming Markdown in iodilos
 
-This document renders into a single LineFlow. It is fed character-by-character
+This document renders into a single TextSurface. It is fed character-by-character
 to simulate a live token stream, just like an LLM typing out an answer.
 
 ## Inline styles
 
 Here is a paragraph with `inline code`, **bold**, *italic*, and a ~~strike~~.
+Inline math works too: $E = mc^2$ and $x^2 + y^2 = z^2$.
 
 ## Lists
 
@@ -39,7 +40,7 @@ Here is a paragraph with `inline code`, **bold**, *italic*, and a ~~strike~~.
 2. Step two
 
 - [x] Parse Markdown into blocks
-- [x] Render each block to Lines
+- [x] Render each block to TextSurface
 - [ ] Ship to production
 
 ## A quote
@@ -59,12 +60,39 @@ fn fib(n: u32) -> u32 {
 }
 ```
 
+## Math
+
+Display math:
+
+$$
+\\int_{0}^{\\infty} e^{-x^2} dx = \\frac{\\sqrt{\\pi}}{2}
+$$
+
+Fenced LaTeX:
+
+```latex
+\\frac{a+b}{c} = \\sum_{n=0}^{\\infty} x_n
+```
+
+## Mermaid flowchart
+
+```mermaid
+flowchart TD
+    A[Markdown input] --> B{Block type}
+    B -->|latex| C[Unicode math]
+    B -->|mermaid| D[Terminal diagram]
+    C --> E[TextSurface]
+    D --> E
+```
+
 ## A table
 
 | Feature    | Supported |
 |------------|:---------:|
 | Headings   |    yes    |
 | Code       |    yes    |
+| Math       |    yes    |
+| Mermaid    |    yes    |
 | Tables     |    yes    |
 | Inline     |    yes    |
 ";
@@ -104,11 +132,13 @@ fn app() -> View {
     // Incremental parser held outside the memo so its committed-prefix cache
     // survives every rebuild; each tick re-parses only the open tail.
     let parser = std::rc::Rc::new(std::cell::RefCell::new(StreamingParser::new()));
-    let lines = create_memo(move || {
+    let surface = create_memo(move || {
         let width = (term_cols.get() as i32).saturating_sub(4).max(1) as usize;
-        parser.borrow_mut().feed_to_lines(&content.get_clone(), width, &theme)
+        parser
+            .borrow_mut()
+            .feed_to_surface(&content.get_clone(), width, &theme)
     });
-    let total_lines = create_memo(move || lines.get_clone().len() as i32);
+    let total_lines = create_memo(move || surface.get_clone().row_count() as i32);
     let max_offset =
         create_memo(move || total_lines.get().saturating_sub(visible_rows.get()).max(0));
     let top_offset = create_memo(move || {
@@ -165,9 +195,8 @@ fn app() -> View {
                 border_color = Color::DarkGrey,
             ) {
                 (move || {
-                    // Build a LineFlow carrying the current lines + offset.
-                    View::from_node(TuiNode::create_line_flow_node(
-                        lines.get_clone(),
+                    View::from_node(TuiNode::create_text_surface_node(
+                        surface.get_clone(),
                         top_offset.get(),
                     ))
                 })

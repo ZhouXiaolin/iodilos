@@ -18,7 +18,9 @@ pub struct MarkdownTheme {
     pub link_text: Color,
     /// Inline `code` text color.
     pub code_text: Color,
-    /// Background fill for fenced code blocks.
+    /// Background fill for code (retained for theme compatibility; inline code
+    /// no longer paints a background so it blends with surrounding text).
+    #[allow(dead_code)]
     pub code_bg: Color,
     /// Border color of the code-block frame.
     pub code_border: Color,

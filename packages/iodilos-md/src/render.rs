@@ -157,7 +157,10 @@ fn inline_runs(
                     format!(" {t} "),
                     SpanStyle {
                         fg: Some(theme.code_text),
-                        bg: Some(theme.code_bg),
+                        // No background: keep inline code on the same
+                        // background as the surrounding text so it doesn't
+                        // paint a grey block (which left visible residue when
+                        // the surface scrolled).
                         ..SpanStyle::default()
                     },
                 ));
@@ -1223,6 +1226,34 @@ mod tests {
         assert!(
             distinct.len() >= 2,
             "expected at least 2 distinct colors, got {colors:?}"
+        );
+    }
+
+    #[test]
+    fn table_cell_with_inline_code_keeps_content() {
+        // Inline `code` inside a table cell used to be dropped (only `Text`
+        // events were routed to the cell buffer), so `| `path` | desc |`
+        // rendered an empty first column. Guard against that regression.
+        let theme = MarkdownTheme::default();
+        let src = "| 路径 | 说明 |\n|------|------|\n| `Cargo.toml` | 工作空间根配置 |\n| `docs/` | 架构决策记录 |\n";
+        let surface = render_to_surface(src, 60, &theme);
+        let joined: String = surface
+            .rows()
+            .iter()
+            .flat_map(|r| r.segments.iter())
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(
+            joined.contains("Cargo.toml"),
+            "inline-code cell content must be rendered: {joined}"
+        );
+        assert!(
+            joined.contains("docs/"),
+            "inline-code cell content must be rendered: {joined}"
+        );
+        assert!(
+            joined.contains("工作空间根配置"),
+            "sibling text cell preserved: {joined}"
         );
     }
 }

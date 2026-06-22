@@ -713,6 +713,19 @@ fn paint_node(
             let width = node.rect.width as usize;
             let layout = surface.layout(width, text);
             let clip_rect = intersect_rect(node.rect, clip).unwrap_or(PaintRect::ZERO);
+            // Wipe any stale characters from the previous frame inside this
+            // node's visible rect BEFORE painting the new rows. Without this, a
+            // text surface that does not cover every cell of its rect (e.g. a
+            // manually-scrolled transcript pre-sliced to `viewport_rows`) would
+            // leave old characters in the canvas; the diff path then either
+            // short-circuits on equal cells or keeps the previous frame's
+            // inline-code background visible, producing the "bg shifts on
+            // scroll" artefact. `clear_text` resets the canvas cells to their
+            // default character (None), so the diff emits a space and a bg
+            // reset for those cells.
+            if clip_rect.width > 0 && clip_rect.height > 0 {
+                canvas.clear_text(clip_rect.to_canvas_rect());
+            }
             // The on-screen window for this node is its clipped rect. The node's
             // own `rect.height` is its *natural* content height (taffy does not
             // shrink a child of an `overflow: hidden` parent), so the visible

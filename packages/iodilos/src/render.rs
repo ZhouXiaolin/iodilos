@@ -296,6 +296,41 @@ impl RenderState {
 /// For each cell that differs, move the cursor to that cell and re-emit it
 /// with its style deltas. This is the terminal cell-buffer diff from
 /// ADR-0024 §12 over the self-built `Canvas` rather than a ratatui `Buffer`.
+/// Reseed the diff pass's running `background` / `text_style` trackers to
+/// reflect the terminal state a given `prev` cell left behind. The trackers
+/// normally describe whatever the *last emitted* cell in the diff pass set, but
+/// when a changed cell is the first one touched on a line (or follows a run of
+/// unchanged cells), that's some other cell's state — not this cell's.
+///
+/// Per-cell painting applies `character.style.bg` first, then
+/// `background_color` overrides it, so the effective terminal background of a
+/// previously-painted cell is `background_color` if set, else the character's
+/// `style.bg`, else `None`.
+fn reseed_trackers(
+    prev_cell: Option<&crate::canvas::CanvasCell>,
+    background: &mut Option<crate::Color>,
+    text_style: &mut crate::text::SpanStyle,
+) {
+    use crate::canvas::CanvasCell;
+    let empty = CanvasCell::default();
+    let prev = prev_cell.unwrap_or(&empty);
+    let effective_bg = prev.background_color.or_else(|| {
+        prev.character
+            .as_ref()
+            .and_then(|c| c.style.bg)
+    });
+    *background = effective_bg;
+    *text_style = prev
+        .character
+        .as_ref()
+        .map(|c| c.style)
+        .unwrap_or_default();
+    // The character's style.bg is folded into `effective_bg` / tracked via the
+    // bg field; keep text_style.bg consistent with the effective background so
+    // the per-attribute checks treat them coherently.
+    text_style.bg = effective_bg;
+}
+
 fn diff_and_draw<W: Write>(w: &mut W, prev: &Canvas, next: &Canvas) -> io::Result<()> {
     use crossterm::csi;
     use crossterm::style::{Color, SetBackgroundColor, SetForegroundColor};
@@ -323,6 +358,18 @@ fn diff_and_draw<W: Write>(w: &mut W, prev: &Canvas, next: &Canvas) -> io::Resul
             let Some(cell) = next_cell else { continue };
             // Position the cursor explicitly at this cell.
             write!(w, csi!("{};{}H"), y + 1, x + 1)?;
+            // The terminal currently shows `prev_cell` at this position (the
+            // previous frame's output). The `background`/`text_style` trackers
+            // describe whatever the *last emitted* cell in this diff pass left
+            // behind — which is NOT necessarily this cell's prior state. So that
+            // the per-attribute "did it change?" checks below compare against
+            // what's really on screen here, reseed the trackers from
+            // `prev_cell`'s effective terminal state before emitting. Without
+            // this, a cell that lost its inline-code background (now plain,
+            // `style.bg == None`) would match the tracker's `None` and skip the
+            // bg reset — leaving the old DarkGrey block lingering on screen
+            // after a scroll.
+            reseed_trackers(prev_cell, &mut background, &mut text_style);
             if let Some(ch) = &cell.character {
                 let needs_reset = !ch.style.sub_modifier.is_empty()
                     || (ch.style.fg.is_none() && text_style.fg.is_some())
@@ -975,6 +1022,77 @@ mod tests {
         assert!(
             !after.starts_with("\x1b[1;2H "),
             "diff repainted the wide glyph's trailing cell as a space: {output:?}"
+        );
+    }
+
+    /// Regression: a cell that previously carried an inline-code background
+    /// (via `character.style.bg`) must have that background RESET when the next
+    /// frame paints a plain cell on top of it. The diff's per-cell equality
+    /// short-circuit must not skip the background change.
+    ///
+    /// Scenario: row 0 holds `code` with `bg=DarkGrey`; after scrolling, the
+    /// same on-screen cell becomes plain text `code` with no background. The
+    /// diff must emit `SetBackgroundColor(Reset)` for that cell, otherwise the
+    /// DarkGrey block lingers on screen.
+    #[test]
+    fn diff_resets_character_bg_when_cell_changes_to_plain() {
+        use crossterm::style::Color;
+        crossterm::style::force_color_output(true);
+
+        let grey = SpanStyle {
+            bg: Some(Color::DarkGrey),
+            ..SpanStyle::default()
+        };
+        let mut prev = Canvas::empty(Rect::new(0, 0, 6, 1));
+        // "  code  " with DarkGrey background (mirrors inline-code rendering).
+        prev.set_text(Rect::new(0, 0, 6, 1), " code ", grey);
+
+        let mut next = Canvas::empty(Rect::new(0, 0, 6, 1));
+        // After scroll: the same on-screen cells now hold plain text, no bg.
+        next.set_text(Rect::new(0, 0, 6, 1), "plain", SpanStyle::default());
+
+        let mut out = Vec::new();
+        diff_and_draw(&mut out, &prev, &next).unwrap();
+        let output = String::from_utf8_lossy(&out);
+
+        // The first changed cell is at (0,0) → cursor-move `\x1b[1;1H`. For the
+        // DarkGrey to be cleared, that move must be followed by a SGR that
+        // resets/changes the background BEFORE the character is drawn. The bug
+        // emits `\x1b[1;1Hp` (move straight to the char), leaving Grey on screen.
+        let first_cell = output.split('p').next().unwrap_or("");
+        assert!(
+            first_cell.contains("0m") || first_cell.contains("49m") || first_cell.contains("48;"),
+            "first changed cell must reset/change the lingering bg before its char: {output:?}"
+        );
+    }
+
+    /// Companion regression: a cell whose previous frame set an opaque
+    /// `background_color` (a styled panel, not an inline-code span) must also be
+    /// reset when the next frame paints a default-bg cell on top of it. Covers
+    /// the second of the two background channels.
+    #[test]
+    fn diff_resets_node_background_color_when_cell_changes_to_plain() {
+        use crossterm::style::Color;
+        crossterm::style::force_color_output(true);
+
+        let mut prev = Canvas::empty(Rect::new(0, 0, 3, 1));
+        // A panel painted an opaque background, then plain text on top.
+        prev.set_background_color(Rect::new(0, 0, 3, 1), Color::Blue);
+        prev.set_text(Rect::new(0, 0, 3, 1), "abc", SpanStyle::default());
+
+        let mut next = Canvas::empty(Rect::new(0, 0, 3, 1));
+        next.set_text(Rect::new(0, 0, 3, 1), "xyz", SpanStyle::default());
+
+        let mut out = Vec::new();
+        diff_and_draw(&mut out, &prev, &next).unwrap();
+        let output = String::from_utf8_lossy(&out);
+
+        // First changed cell at (0,0) → the Blue bg must be reset before the
+        // first char `x` is drawn.
+        let first_cell = output.split('x').next().unwrap_or("");
+        assert!(
+            first_cell.contains("0m") || first_cell.contains("49m") || first_cell.contains("48;"),
+            "first changed cell must reset the node bg before its char: {output:?}"
         );
     }
 

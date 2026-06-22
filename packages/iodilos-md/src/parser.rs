@@ -229,9 +229,17 @@ impl<'a> ParseState<'a> {
         // Inside a table cell, route text to the cell buffer.
         if self.cell_buf.is_some() && matches!(self.stack.last(), Some(Frame::Table(_))) {
             match ev {
-                Event::Text(t) => {
+                Event::Text(t)
+                | Event::Code(t)
+                | Event::InlineMath(t)
+                | Event::DisplayMath(t) => {
                     if let Some(buf) = self.cell_buf.as_mut() {
                         buf.push_str(t.as_ref());
+                    }
+                }
+                Event::SoftBreak | Event::HardBreak => {
+                    if let Some(buf) = self.cell_buf.as_mut() {
+                        buf.push('\n');
                     }
                 }
                 Event::End(TagEnd::TableCell) => {
@@ -684,6 +692,37 @@ mod tests {
         assert_eq!(table.headers, vec!["H1".to_string(), "H2".to_string()]);
         assert_eq!(table.rows.len(), 2);
         assert_eq!(table.rows[0], vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn parses_table_cell_with_inline_code_and_math() {
+        // Inline `code` (and $math$) inside a table cell used to be silently
+        // dropped because the cell routing only matched `Event::Text`. The
+        // renderer flattens cells to plain text, so we expect the raw content
+        // (without backticks / dollar signs) to land in the cell.
+        let src =
+            "| key | value |\n|---|---|\n| `Cargo.toml` | $x^2$ and text |\n";
+        let b = blocks(src);
+        let table = b
+            .iter()
+            .find_map(|x| {
+                if let Block::Table(t) = x {
+                    Some(t)
+                } else {
+                    None
+                }
+            })
+            .expect("a table");
+        assert_eq!(
+            table.rows[0][0], "Cargo.toml",
+            "inline code must be captured in table cell: {:?}",
+            table.rows
+        );
+        assert!(
+            table.rows[0][1].contains("x^2") && table.rows[0][1].contains("and text"),
+            "inline math + text both captured: {:?}",
+            table.rows
+        );
     }
 
     #[test]

@@ -20,12 +20,7 @@ use iodilos::view::View;
 /// Render a non-reactive snapshot of the prompt into a `View` (scroll 0) using
 /// the default theme. Reactive apps drive `render_prompt_to_surface` from a
 /// memo instead (see `examples/prompt_box.rs`).
-pub fn prompt_view(
-    buffer: &str,
-    cursor: usize,
-    statusline: &StatusLine,
-    width: usize,
-) -> View {
+pub fn prompt_view(buffer: &str, cursor: usize, statusline: &StatusLine, width: usize) -> View {
     let surface =
         render_prompt_to_surface(buffer, cursor, statusline, width, &PromptTheme::default());
     View::text_surface(surface)

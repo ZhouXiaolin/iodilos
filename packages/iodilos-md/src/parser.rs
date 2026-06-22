@@ -49,7 +49,10 @@ pub enum Block {
     /// `diagram` carries a pre-rendered diagram when an upstream caller (the
     /// streaming parser's sticky cache) has already resolved it; `None` means
     /// the renderer parses `src` itself.
-    Mermaid { src: String, diagram: Option<String> },
+    Mermaid {
+        src: String,
+        diagram: Option<String>,
+    },
     /// A YAML-style frontmatter block (`---\n…\n---`) flattened to key/value
     /// pairs.
     Frontmatter(Vec<(String, String)>),

@@ -133,6 +133,17 @@ impl Canvas {
         self.cells.get(y).and_then(|row| row.get(x))
     }
 
+    /// Whether `(x, y)` is the blank trailing cell occupied by a wide glyph
+    /// that starts immediately to its left.
+    pub(crate) fn cell_is_wide_continuation(&self, x: usize, y: usize) -> bool {
+        if x == 0 {
+            return false;
+        }
+        self.cell(x - 1, y)
+            .and_then(|cell| cell.character.as_ref())
+            .is_some_and(|character| character.width() > 1)
+    }
+
     /// Paint a solid `background_color` across the given rect.
     pub fn set_background_color(&mut self, rect: Rect, color: Color) {
         for y in rect.y..rect.bottom() {
@@ -561,6 +572,17 @@ mod tests {
             !after.starts_with(' '),
             "wide char's trailing cell was emitted as a space, shifting the row: {after:?}"
         );
+    }
+
+    #[test]
+    fn wide_char_marks_trailing_cell_as_continuation() {
+        use crate::text::SpanStyle;
+        let mut canvas = Canvas::empty(Rect::new(0, 0, 4, 1));
+        canvas.set_text(Rect::new(0, 0, 4, 1), "好XY", SpanStyle::default());
+
+        assert!(!canvas.cell_is_wide_continuation(0, 0));
+        assert!(canvas.cell_is_wide_continuation(1, 0));
+        assert!(!canvas.cell_is_wide_continuation(2, 0));
     }
 
     #[test]

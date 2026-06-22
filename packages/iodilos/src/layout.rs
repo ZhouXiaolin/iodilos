@@ -14,7 +14,7 @@ use taffy::{NodeId as TaffyNodeId, TaffyTree};
 use crate::attributes::resolve_style;
 use crate::canvas::{Canvas, Rect};
 use crate::node::{NodeId, TuiNode};
-use crate::style::{Edges, Style};
+use crate::style::{Edges, Inset, Style};
 use crate::surface::TextSurface;
 use crate::text::SpanStyle;
 
@@ -107,6 +107,203 @@ struct PaintNode {
     style: Style,
     children: Vec<PaintNode>,
     surface: Option<(TextSurface, i32)>,
+}
+
+impl PaintNode {
+    /// Recompute this node's `rect` to `new_rect` and re-layout the subtree
+    /// beneath it against that corrected size.
+    ///
+    /// Used for an absolutely-positioned overlay box whose `rect` had to be
+    /// re-derived from its real containing block (the screen) because taffy
+    /// sized it against a collapsed `Dynamic` wrapper (height 0). Taffy laid the
+    /// whole subtree out against that zero-height block, so percentage sizes
+    /// (`height: 100%`) collapsed to 0 and flex distribution is wrong. This
+    /// re-runs a flex pass over the subtree using `new_rect`'s content box:
+    /// each in-flow child's main-axis basis is its explicit length/percent or —
+    /// for auto-sized leaves — the measured content height at the available
+    /// width; remaining space is split by `flex_grow` (overflow shrunk by
+    /// `flex_shrink`). Absolute descendants resolve against this node's rect.
+    fn recompute_rect(&mut self, new_rect: PaintRect) {
+        self.rect = new_rect;
+        let content = content_box(self.rect, &self.style);
+
+        let (abs, in_flow): (Vec<usize>, Vec<usize>) = (0..self.children.len())
+            .partition(|i| self.children[*i].style.position == taffy::style::Position::Absolute);
+
+        let is_row = self.style.flex_direction == FlexDirection::Row;
+        let total = if is_row { content.width } else { content.height } as f32;
+        let basis_of = |c: &PaintNode| {
+            if is_row {
+                basis_main(c, total, true, content)
+            } else {
+                basis_main(c, total, false, content)
+            }
+        };
+        let (sizes, _rem) = flex_distribute(&self.children, &in_flow, total, basis_of);
+
+        let mut cursor = if is_row { content.x } else { content.y } as f32;
+        for &i in &in_flow {
+            let main = (sizes[&i]).max(0.0).round() as u16;
+            if is_row {
+                let cross = resolve_cross(&self.children[i], false, content);
+                let r = PaintRect::new(cursor.round() as i32, content.y, main, cross);
+                self.children[i].recompute_rect(r);
+            } else {
+                let cross = resolve_cross(&self.children[i], true, content);
+                let r = PaintRect::new(content.x, cursor.round() as i32, cross, main);
+                self.children[i].recompute_rect(r);
+            }
+            cursor += main as f32;
+        }
+
+        for &i in &abs {
+            let r = absolute_rect_from_insets(&self.children[i].style, self.rect);
+            self.children[i].recompute_rect(r);
+        }
+    }
+}
+
+/// A node's content box: border box minus the drawn border edges.
+fn content_box(rect: PaintRect, style: &Style) -> PaintRect {
+    if style.border_style.is_none() {
+        return rect;
+    }
+    let edges = style.border_edges.unwrap_or(Edges::all());
+    let left = u16::from(edges.contains(Edges::LEFT));
+    let right = u16::from(edges.contains(Edges::RIGHT));
+    let top = u16::from(edges.contains(Edges::TOP));
+    let bottom = u16::from(edges.contains(Edges::BOTTOM));
+    PaintRect::new(
+        rect.x + (left as i32),
+        rect.y + (top as i32),
+        rect.width.saturating_sub(left).saturating_sub(right),
+        rect.height.saturating_sub(top).saturating_sub(bottom),
+    )
+}
+
+/// An in-flow child's main-axis basis before grow/shrink: an explicit
+/// length/percent wins; otherwise an auto-sized leaf is measured at the
+/// available cross size (column→width, row→height); otherwise 0.
+fn basis_main(child: &PaintNode, container: f32, row: bool, content: PaintRect) -> f32 {
+    let size = if row { child.style.width } else { child.style.height };
+    match size {
+        crate::style::Size::Length(v) => v as f32,
+        crate::style::Size::Percent(p) => (p / 100.0) * container,
+        _ => measure_auto(child, row, content),
+    }
+}
+
+/// Cross-axis size of an in-flow child: explicit length/percent wins; otherwise
+/// for a column the child fills the content width, for a row the content
+/// height. (`align_items: stretch` is the default we support here.)
+fn resolve_cross(child: &PaintNode, column: bool, content: PaintRect) -> u16 {
+    let size = if column { child.style.width } else { child.style.height };
+    let container = if column { content.width } else { content.height } as f32;
+    match size {
+        crate::style::Size::Length(v) => v as u16,
+        crate::style::Size::Percent(p) => ((p / 100.0) * container).round() as u16,
+        _ => {
+            // Stretch to the content cross axis, but not below the leaf's own
+            // measured minimum (a single-line text leaf is 1 tall).
+            let measured = measure_auto(child, !column, content).max(1.0) as u16;
+            if column {
+                content.width.max(measured)
+            } else {
+                content.height.max(measured)
+            }
+        }
+    }
+}
+
+/// Measured content main-size for an auto-sized node at the available cross
+/// size (column→width, row→height). A leaf with a surface is measured
+/// directly; a container recursively sums its in-flow children's measured
+/// main-sizes (plus its own padding/gap), so an auto-height prompt wrapper
+/// around a text leaf resolves to the leaf's height, not 0.
+fn measure_auto(node: &PaintNode, row: bool, content: PaintRect) -> f32 {
+    if let Some((surface, _)) = &node.surface {
+        let width = if row { content.height } else { content.width } as usize;
+        if row {
+            return surface.max_width().max(1) as f32;
+        }
+        return surface.layout(width.max(1), SpanStyle::default()).height() as f32;
+    }
+    // Container: sum in-flow children's measured main sizes + padding + gaps.
+    let inner = content_box(content, &node.style);
+    let cross_size = if row { inner.height } else { inner.width } as usize;
+    let gap = match node.style.gap {
+        crate::style::Gap::Unset => {
+            if row { node.style.row_gap } else { node.style.column_gap }
+        }
+        other => other,
+    };
+    let gap_px = match gap {
+        crate::style::Gap::Length(v) => v as f32,
+        crate::style::Gap::Percent(p) => (p / 100.0) * cross_size as f32,
+        _ => 0.0,
+    };
+    let is_row = node.style.flex_direction == FlexDirection::Row;
+    let mut total = 0.0f32;
+    let mut count = 0u32;
+    for child in &node.children {
+        if child.style.position == taffy::style::Position::Absolute {
+            continue;
+        }
+        let basis = if is_row == row {
+            // Same axis: measure the child's main size at the cross content size.
+            basis_main(child, cross_size as f32, row, inner)
+        } else {
+            // Cross axis: the child's measured cross size contributes to THIS
+            // node's main size only via its own main layout; approximate with
+            // the child's auto measure on this node's main axis.
+            measure_auto(child, row, inner)
+        };
+        total += basis;
+        count += 1;
+    }
+    if count > 1 {
+        total += gap_px * (count - 1) as f32;
+    }
+    total
+}
+
+/// Resolve an in-flow set of children's main-axis sizes by flexbox: each gets
+/// its basis, then leftover space is grown (or overflow shrunk).
+fn flex_distribute(
+    children: &[PaintNode],
+    in_flow: &[usize],
+    total: f32,
+    basis_of: impl Fn(&PaintNode) -> f32,
+) -> (std::collections::HashMap<usize, f32>, f32) {
+    let mut sizes: std::collections::HashMap<usize, f32> = std::collections::HashMap::new();
+    let mut remaining = total;
+    let mut total_grow = 0.0f32;
+    for &i in in_flow {
+        let basis = basis_of(&children[i]).min(remaining.max(0.0));
+        sizes.insert(i, basis);
+        remaining -= basis;
+        total_grow += children[i].style.flex_grow;
+    }
+    if total_grow > 0.0 && remaining > 0.0 {
+        for &i in in_flow {
+            let frac = children[i].style.flex_grow / total_grow;
+            *sizes.get_mut(&i).unwrap() += frac * remaining;
+        }
+        remaining = 0.0;
+    } else if remaining < 0.0 {
+        let total_shrink: f32 = in_flow
+            .iter()
+            .map(|&i| children[i].style.flex_shrink.unwrap_or(1.0))
+            .sum();
+        if total_shrink > 0.0 {
+            for &i in in_flow {
+                let s = children[i].style.flex_shrink.unwrap_or(1.0) / total_shrink;
+                *sizes.get_mut(&i).unwrap() += s * remaining;
+            }
+        }
+        remaining = 0.0;
+    }
+    (sizes, remaining)
 }
 
 /// A rectangle in terminal-cell space, used inside the paint pipeline. Unlike
@@ -375,7 +572,42 @@ fn extract_node(
     let children = built
         .children
         .iter()
-        .map(|child| extract_node(tree, child, rect, index))
+        .map(|child| {
+            let (child_parent, child_rect_override) = if built.tag.is_none()
+                && child.style.position == taffy::style::Position::Absolute
+            {
+                // A `Dynamic` wrapper (no tag) collapses to zero height when it
+                // is a flex item after a non-growing sibling, and taffy makes
+                // the Dynamic the containing block for its absolute child — so
+                // taffy sizes the child to 0. Reparent the child to the screen
+                // (its true containing block) and re-derive its rect from the
+                // containing block minus the child's own insets, instead of the
+                // (collapsed) size taffy computed.
+                let containing = parent_rect;
+                let r = absolute_rect_from_insets(&child.style, containing);
+                (containing, Some(r))
+            } else {
+                (rect, None)
+            };
+            let mut paint = extract_node(tree, child, child_parent, index);
+            if let Some(r) = child_rect_override {
+                paint.rect = r;
+                // Keep the runtime index in sync so hit testing/focus use the
+                // corrected on-screen rect, not the collapsed taffy size.
+                index.nodes.insert(child.runtime_id, RuntimeNode {
+                    parent: child.parent,
+                    rect: r.to_canvas_rect(),
+                    tag: child.tag.clone(),
+                });
+                // The child's subtree was laid out by taffy against a
+                // zero-height containing block, so every descendant's size is
+                // wrong. Re-layout the subtree against the corrected rect so a
+                // `height: 100%` content root fills the overlay and its flex
+                // children anchor to the bottom instead of collapsing to 0.
+                paint.recompute_rect(r);
+            }
+            paint
+        })
         .collect();
     PaintNode {
         rect,
@@ -383,6 +615,42 @@ fn extract_node(
         children,
         surface: built.surface.clone(),
     }
+}
+
+/// Resolve an absolutely-positioned node's rect from a containing block and the
+/// node's own insets (`top`/`right`/`bottom`/`left`, falling back to `inset`).
+/// Used when the real containing block (the screen) differs from the one taffy
+/// resolved (a collapsed wrapper), so the size can't be trusted from layout.
+///
+/// Horizontal insets (`left`/`right`) resolve percentages against the
+/// containing block's width; vertical ones (`top`/`bottom`) against its height
+/// — matching CSS and `LengthPercentage::resolve` in taffy.
+fn absolute_rect_from_insets(style: &Style, containing: PaintRect) -> PaintRect {
+    // Mirrors `Inset::or` (private in style.rs): `Unset` falls back to the
+    // aggregate `inset`, otherwise the per-side value wins. `Auto` on an
+    // absolutely-positioned edge means "not pinned on this side" (no offset),
+    // so it resolves to 0 here.
+    let pct_of = |p: f32, axis: u16| -> i32 { ((p / 100.0) * axis as f32).round() as i32 };
+    let resolve = |side: Inset, fallback: Inset, axis: u16| -> i32 {
+        let resolved = match side {
+            Inset::Unset => fallback,
+            other => other,
+        };
+        match resolved {
+            Inset::Length(v) => v as i32,
+            Inset::Percent(p) => pct_of(p, axis),
+            Inset::Unset | Inset::Auto => 0,
+        }
+    };
+    let top = resolve(style.top, style.inset, containing.height);
+    let bottom = resolve(style.bottom, style.inset, containing.height);
+    let left = resolve(style.left, style.inset, containing.width);
+    let right = resolve(style.right, style.inset, containing.width);
+    let x = containing.x + left;
+    let y = containing.y + top;
+    let width = containing.width.saturating_sub((left + right).max(0) as u16);
+    let height = containing.height.saturating_sub((top + bottom).max(0) as u16);
+    PaintRect::new(x, y, width, height)
 }
 
 /// Paint a node into the canvas: background, border, then text, recursing with
@@ -1066,6 +1334,51 @@ mod tests {
     }
 
     #[test]
+    fn dynamic_wrapper_does_not_collapse_absolute_child_containing_block() {
+        let mut nodes = Vec::new();
+
+        let root = create_root(|| {
+            let view: View = tags::div()
+                .width(crate::style::Size::Percent(100.0))
+                .height(crate::style::Size::Percent(100.0))
+                .children((
+                    tags::p().children("under"),
+                    View::from_dynamic(|| {
+                        tags::div()
+                            .position(taffy::style::Position::Absolute)
+                            .top(0)
+                            .right(0)
+                            .bottom(0)
+                            .left(0)
+                            .width(crate::style::Size::Percent(100.0))
+                            .height(crate::style::Size::Percent(100.0))
+                            .background_color(crate::Color::Reset)
+                            .children(tags::p().children("overlay"))
+                    }),
+                ))
+                .into();
+            nodes = view.nodes.into_iter().collect();
+        });
+
+        let (canvas, _index) = render(&nodes, Rect::new(0, 0, 20, 4), None);
+        let painted = canvas_to_plain_text(&canvas);
+
+        assert!(
+            painted
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .starts_with("overlay"),
+            "absolute overlay should paint from the parent origin: {painted}"
+        );
+        assert!(
+            !painted.contains("under"),
+            "overlay background should cover underlying content: {painted}"
+        );
+        root.dispose();
+    }
+
+    #[test]
     fn text_surface_layout_breaks_at_width() {
         use crate::surface::{TextRow, TextSegment, TextSurface};
 
@@ -1213,6 +1526,35 @@ mod tests {
     }
 
     #[test]
+    fn text_surface_places_ascii_after_cjk_by_display_width() {
+        use crate::surface::TextRow;
+        let mut nodes = Vec::new();
+        let root = crate::reactive::create_root(|| {
+            let view: View = tags::div()
+                .width(6)
+                .children(View::from(TextRow::raw("好XY")))
+                .into();
+            nodes = view.nodes.into_iter().collect();
+        });
+        let (canvas, _index) = render(&nodes, Rect::new(0, 0, 6, 1), None);
+
+        assert_eq!(
+            canvas.cell(0, 0).unwrap().character.as_ref().unwrap().value,
+            "好"
+        );
+        assert!(canvas.cell(1, 0).unwrap().character.is_none());
+        assert_eq!(
+            canvas.cell(2, 0).unwrap().character.as_ref().unwrap().value,
+            "X"
+        );
+        assert_eq!(
+            canvas.cell(3, 0).unwrap().character.as_ref().unwrap().value,
+            "Y"
+        );
+        root.dispose();
+    }
+
+    #[test]
     fn dim_and_crossed_out_builders_set_style_fields() {
         let mut nodes = Vec::new();
         let root = crate::reactive::create_root(|| {
@@ -1282,6 +1624,182 @@ mod tests {
         assert!(
             painted.contains("[ hi ]"),
             "button chrome should paint: {painted}"
+        );
+        root.dispose();
+    }
+
+    /// Reproduces the flown `overlay_layer` nesting: a full-screen Column root
+    /// holding [grow-child, shrink-child, Dynamic(absolute full-bleed overlay)].
+    /// The overlay's own content root is `width/height: Percent(100)`. The
+    /// overlay must stretch to cover the whole screen, hiding the shrink-child's
+    /// text beneath it. Regression for the btw overlay failing to cover.
+    #[test]
+    fn dynamic_wrapped_absolute_full_bleed_covers_sibling_when_root_is_column() {
+        let mut nodes = Vec::new();
+        let root = create_root(|| {
+            let view: View = tags::div()
+                .flex_direction(FlexDirection::Column)
+                .width(crate::style::Size::Percent(100.0))
+                .height(crate::style::Size::Percent(100.0))
+                .children((
+                    // grow child (transcript)
+                    tags::div()
+                        .flex_grow(1.0)
+                        .children(tags::p().children("GROW")),
+                    // shrink child (prompt) — this must be hidden by the overlay
+                    tags::div()
+                        .flex_shrink(0.0)
+                        .children(tags::p().children("SHOULD-BE-COVERED")),
+                    // overlay_layer: a Dynamic wrapping an absolute full-bleed box
+                    View::from_dynamic(|| {
+                        View::from(
+                            tags::div()
+                                .position(taffy::style::Position::Absolute)
+                                .top(0)
+                                .right(0)
+                                .bottom(0)
+                                .left(0)
+                                .background_color(crate::Color::Reset)
+                                .children(
+                                    tags::div()
+                                        .flex_direction(FlexDirection::Column)
+                                        .width(crate::style::Size::Percent(100.0))
+                                        .height(crate::style::Size::Percent(100.0))
+                                        .children(tags::p().children("OVERLAY")),
+                                ),
+                        )
+                    }),
+                ))
+                .into();
+            nodes = view.nodes.into_iter().collect();
+        });
+        let (canvas, _index) = render(&nodes, Rect::new(0, 0, 40, 10), None);
+        let painted = canvas_to_plain_text(&canvas);
+
+        assert!(
+            !painted.contains("SHOULD-BE-COVERED"),
+            "full-bleed overlay must cover the shrink sibling: {painted:?}"
+        );
+        root.dispose();
+    }
+
+    /// Regression for issue 3: a full-bleed overlay's content — a column of a
+    /// growing transcript and a non-growing prompt — must anchor the prompt to
+    /// the BOTTOM of the screen, not collapse both children to the top. Before
+    /// the `extract_node` re-layout, taffy sized the overlay's content root to
+    /// 0 (collapsed Dynamic containing block), so the prompt painted at row 0.
+    #[test]
+    fn full_bleed_overlay_column_anchors_prompt_to_bottom() {
+        let mut nodes = Vec::new();
+        let root = create_root(|| {
+            let view: View = tags::div()
+                .flex_direction(FlexDirection::Column)
+                .width(crate::style::Size::Percent(100.0))
+                .height(crate::style::Size::Percent(100.0))
+                .children((
+                    tags::p().children("GROW"),
+                    tags::p().children("SHRINK"),
+                    View::from_dynamic(|| {
+                        View::from(
+                            tags::div()
+                                .position(taffy::style::Position::Absolute)
+                                .top(0)
+                                .right(0)
+                                .bottom(0)
+                                .left(0)
+                                .background_color(crate::Color::Reset)
+                                .children(
+                                    tags::div()
+                                        .flex_direction(FlexDirection::Column)
+                                        .width(crate::style::Size::Percent(100.0))
+                                        .height(crate::style::Size::Percent(100.0))
+                                        .children((
+                                            // transcript grows to fill
+                                            tags::div()
+                                                .flex_grow(1.0)
+                                                .children(tags::p().children("TOP")),
+                                            // prompt stays at the bottom
+                                            tags::div()
+                                                .flex_shrink(0.0)
+                                                .children(tags::p().children("BOTTOM-PROMPT")),
+                                        )),
+                                ),
+                        )
+                    }),
+                ))
+                .into();
+            nodes = view.nodes.into_iter().collect();
+        });
+        // 10 rows: transcript fills 9, prompt on row 9 (the last).
+        let (canvas, _index) = render(&nodes, Rect::new(0, 0, 40, 10), None);
+        let painted = canvas_to_plain_text(&canvas);
+        let lines: Vec<&str> = painted.lines().collect();
+
+        assert_eq!(lines.len(), 10);
+        assert!(
+            lines[9].contains("BOTTOM-PROMPT"),
+            "prompt must anchor to the last row, got row 9 = {:?}; full painted:\n{painted}",
+            lines[9]
+        );
+        assert!(
+            !lines[0].contains("BOTTOM-PROMPT"),
+            "prompt must not collapse to the top row"
+        );
+        root.dispose();
+    }
+
+    /// Regression for issue 2: an inset overlay (percentage insets on all four
+    /// sides) nested in a collapsed Dynamic must keep its percentage margins —
+    /// 1/8 inset resolves to real rows/cols, not 0 (which previously made the
+    /// box fill the whole screen instead of sitting centered with a margin).
+    #[test]
+    fn inset_overlay_keeps_percentage_margins_in_collapsed_dynamic() {
+        let mut nodes = Vec::new();
+        let root = create_root(|| {
+            let view: View = tags::div()
+                .flex_direction(FlexDirection::Column)
+                .width(crate::style::Size::Percent(100.0))
+                .height(crate::style::Size::Percent(100.0))
+                .children((
+                    tags::p().children("filler"),
+                    View::from_dynamic(|| {
+                        View::from(
+                            tags::div()
+                                .position(taffy::style::Position::Absolute)
+                                // 1/8 inset on every side, like the /model picker.
+                                .top(crate::style::Inset::Percent(12.5))
+                                .right(crate::style::Inset::Percent(12.5))
+                                .bottom(crate::style::Inset::Percent(12.5))
+                                .left(crate::style::Inset::Percent(12.5))
+                                .background_color(crate::Color::Reset)
+                                .border_style(BorderStyle::Round)
+                                .border_color(crate::Color::Cyan)
+                                .children(tags::p().children("PICK")),
+                        )
+                    }),
+                ))
+                .into();
+            nodes = view.nodes.into_iter().collect();
+        });
+        // 80×24 → 12.5% = 10 cols / 3 rows of margin.
+        let (canvas, _index) = render(&nodes, Rect::new(0, 0, 80, 24), None);
+        let painted = canvas_to_plain_text(&canvas);
+
+        // The top border (╭) sits at row 3 (12.5% of 24 ≈ 3) and column 10
+        // (12.5% of 80 = 10) — not at (0,0), which would mean the percentage
+        // inset collapsed to 0.
+        let border_row = painted.lines().position(|l| l.contains('╭'));
+        assert_eq!(
+            border_row,
+            Some(3),
+            "1/8 vertical inset should put the top border at row 3; full painted:\n{painted}"
+        );
+        let border_line = painted.lines().nth(3).unwrap_or_default();
+        let border_col = border_line.find('╭');
+        assert_eq!(
+            border_col,
+            Some(10),
+            "1/8 horizontal inset should put the left border at col 10, got row 3: {border_line:?}"
         );
         root.dispose();
     }

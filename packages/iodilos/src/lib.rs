@@ -32,12 +32,23 @@ pub mod reactive_primitives {
 
 pub use attributes::{Attributes, GlobalAttributes, GlobalAttributesExt, SetAttribute};
 pub use component::{Component, Props};
+pub use components::completion_menu::{CompletionItem, CompletionMenuProps, completion_menu};
 pub use components::custom_element;
+pub use components::overlay_box::{OverlayBoxProps, OverlayGeometry, overlay_box};
+pub use components::scroll_view::{
+    ScrollContent, ScrollViewProps, ScrollWindow, centered_window, scroll_view,
+};
+pub use components::table_view::{
+    CellContext, CellFactory, TableRow, TableSection, TableViewProps, table_view,
+};
 pub use events::{Event, EventKind};
 pub use node::{AsTuiNode, NodeId, TuiNode};
 pub use noderef::NodeRef;
 pub use reactive::*;
-pub use render::{QuitPolicy, RenderConfig, render, render_async, render_async_with, render_with, use_future};
+pub use render::{
+    QuitPolicy, RenderConfig, quit, render, render_async, render_async_with, render_with,
+    use_future,
+};
 pub use style::{
     BorderCharacters, BorderStyle, Edges, FlexBasis, Gap, Inset, Margin, Padding, Percent, Size,
     Style, Weight,
@@ -67,12 +78,23 @@ pub mod prelude {
     };
 
     pub use crate::attributes::{Attributes, GlobalAttributes, GlobalAttributesExt, SetAttribute};
+    pub use crate::components::completion_menu::{
+        CompletionItem, CompletionMenuProps, completion_menu,
+    };
+    pub use crate::components::overlay_box::{OverlayBoxProps, OverlayGeometry, overlay_box};
+    pub use crate::components::scroll_view::{
+        ScrollContent, ScrollViewProps, ScrollWindow, centered_window, scroll_view,
+    };
+    pub use crate::components::table_view::{
+        CellContext, CellFactory, TableRow, TableSection, TableViewProps, table_view,
+    };
     pub use crate::components::tags;
     pub use crate::events::{Event, EventKind};
     pub use crate::node::{NodeId, TuiNode};
     pub use crate::noderef::NodeRef;
     pub use crate::render::{
-        QuitPolicy, RenderConfig, render, render_async, render_async_with, render_with, use_future,
+        QuitPolicy, RenderConfig, quit, render, render_async, render_async_with, render_with,
+        use_future,
     };
     pub use crate::style::{
         BorderCharacters, BorderStyle, Edges, FlexBasis, Gap, Inset, Margin, Padding, Percent,

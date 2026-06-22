@@ -20,7 +20,7 @@ use crate::reactive::{
 use crossterm::cursor::{Hide, Show};
 use crossterm::event::{
     DisableMouseCapture, EnableMouseCapture, Event as CrosstermEvent, EventStream, KeyCode,
-    KeyboardEnhancementFlags, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
+    KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseEvent, MouseEventKind,
     PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
@@ -42,11 +42,16 @@ use crate::view::View;
 struct TuiRuntime {
     task_tx: UnboundedSender<TuiTask>,
     redraw_tx: UnboundedSender<()>,
+    quit_tx: UnboundedSender<()>,
 }
 
 impl TuiRuntime {
     fn request_redraw(&self) {
         let _ = self.redraw_tx.unbounded_send(());
+    }
+
+    fn quit(&self) {
+        let _ = self.quit_tx.unbounded_send(());
     }
 }
 
@@ -112,6 +117,11 @@ pub fn use_future(future: impl Future<Output = ()> + 'static) {
     runtime.request_redraw();
 }
 
+/// Request the active render loop to exit.
+pub fn quit() {
+    use_context::<TuiRuntime>().quit();
+}
+
 impl RenderState {
     fn redraw(&mut self) -> io::Result<()> {
         let (width, height) = size()?;
@@ -132,8 +142,8 @@ impl RenderState {
         Ok(())
     }
 
-    fn dispatch(&mut self, event: Event) {
-        dispatch_event(&self.nodes, &self.index, self.focused, event);
+    fn dispatch(&mut self, event: Event) -> bool {
+        dispatch_event(&self.nodes, &self.index, self.focused, event)
     }
 
     fn focus(&mut self, next: Option<NodeId>) {
@@ -158,22 +168,24 @@ impl RenderState {
         if is_quit_key(key, self.quit) {
             return false;
         }
-        if key.kind == KeyEventKind::Press && key.code == KeyCode::Tab {
-            self.focus_next(key.modifiers.contains(KeyModifiers::SHIFT));
-            return true;
-        }
-
         let kind = match key.kind {
             KeyEventKind::Press => EventKind::KeyDown,
             KeyEventKind::Release => EventKind::KeyUp,
             _ => EventKind::RawKey,
         };
         let target = self.focused;
-        self.dispatch(
+        let raw_stopped = self.dispatch(
             Event::new(EventKind::RawKey)
                 .with_target(target)
                 .with_key(key),
         );
+        if raw_stopped {
+            return true;
+        }
+        if key.kind == KeyEventKind::Press && key.code == KeyCode::Tab {
+            self.focus_next(key.modifiers.contains(KeyModifiers::SHIFT));
+            return true;
+        }
         self.dispatch(Event::new(kind).with_target(target).with_key(key));
 
         if key.kind == KeyEventKind::Press
@@ -300,6 +312,9 @@ fn diff_and_draw<W: Write>(w: &mut W, prev: &Canvas, next: &Canvas) -> io::Resul
 
     for y in 0..height {
         for x in 0..width {
+            if next.cell_is_wide_continuation(x, y) {
+                continue;
+            }
             let prev_cell = prev.cell(x, y);
             let next_cell = next.cell(x, y);
             if prev_cell == next_cell {
@@ -414,7 +429,12 @@ pub async fn render_async_with(
     }
     let (task_tx, task_rx) = unbounded();
     let (redraw_tx, redraw_rx) = unbounded();
-    let runtime = TuiRuntime { task_tx, redraw_tx };
+    let (quit_tx, quit_rx) = unbounded();
+    let runtime = TuiRuntime {
+        task_tx,
+        redraw_tx,
+        quit_tx,
+    };
 
     let state = Rc::new(RefCell::new(RenderState {
         stdout,
@@ -436,7 +456,7 @@ pub async fn render_async_with(
         }
     });
 
-    let result = run_loop(&state, &root, task_rx, redraw_rx).await;
+    let result = run_loop(&state, &root, task_rx, redraw_rx, quit_rx).await;
     root.dispose();
 
     {
@@ -479,11 +499,13 @@ async fn run_loop(
     root: &RootHandle,
     task_rx: UnboundedReceiver<TuiTask>,
     redraw_rx: UnboundedReceiver<()>,
+    quit_rx: UnboundedReceiver<()>,
 ) -> io::Result<()> {
     state.borrow_mut().redraw()?;
     let mut events = EventStream::new().fuse();
     let mut task_rx = task_rx.fuse();
     let mut redraw_rx = redraw_rx.fuse();
+    let mut quit_rx = quit_rx.fuse();
     let mut tasks = FuturesUnordered::new();
 
     loop {
@@ -506,6 +528,9 @@ async fn run_loop(
             }
             _ = redraw_rx.next() => {
                 state.borrow_mut().redraw()?;
+            }
+            _ = quit_rx.next() => {
+                break;
             }
             _ = tasks.next() => {
                 state.borrow_mut().redraw()?;
@@ -534,13 +559,18 @@ fn handle_terminal_event(state: &Rc<RefCell<RenderState>>, event: CrosstermEvent
     }
 }
 
-fn dispatch_event(nodes: &[TuiNode], index: &RuntimeIndex, focused: Option<NodeId>, event: Event) {
+fn dispatch_event(
+    nodes: &[TuiNode],
+    index: &RuntimeIndex,
+    focused: Option<NodeId>,
+    event: Event,
+) -> bool {
     let target = event.target().or(focused);
     let path = target
         .map(|target| index.path_to_root(target))
         .unwrap_or_default();
     if path.is_empty() {
-        return;
+        return false;
     }
     for id in path {
         event.set_current_target(Some(id));
@@ -556,7 +586,9 @@ fn dispatch_event(nodes: &[TuiNode], index: &RuntimeIndex, focused: Option<NodeI
             }
         }
     }
+    let stopped = event.propagation_stopped();
     event.set_current_target(None);
+    stopped
 }
 
 fn event_handlers_in_nodes(
@@ -661,7 +693,12 @@ mod tests {
     fn use_future_registers_task_with_tui_runtime() {
         let (task_tx, mut task_rx) = unbounded();
         let (redraw_tx, _redraw_rx) = unbounded();
-        let runtime = TuiRuntime { task_tx, redraw_tx };
+        let (quit_tx, _quit_rx) = unbounded();
+        let runtime = TuiRuntime {
+            task_tx,
+            redraw_tx,
+            quit_tx,
+        };
 
         let root = create_root(|| {
             provide_context(runtime);
@@ -758,6 +795,52 @@ mod tests {
         );
 
         assert_eq!(&*calls.borrow(), &["child"]);
+        root.dispose();
+    }
+
+    #[test]
+    fn raw_key_stop_propagation_prevents_tab_focus_change() {
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let mut nodes = Vec::new();
+
+        let root = create_root(|| {
+            let view: View = tags::div()
+                .on(events::raw_key, {
+                    let calls = Rc::clone(&calls);
+                    move |event: Event| {
+                        calls.borrow_mut().push("raw");
+                        if event.key().is_some_and(|key| key.code == KeyCode::Tab) {
+                            event.stop_propagation();
+                        }
+                    }
+                })
+                .children((
+                    tags::button().children("First"),
+                    tags::button().children("Second"),
+                ))
+                .into();
+            nodes = view.nodes.into_iter().collect();
+        });
+
+        let (_buffer, index) = render_buffer(&nodes, Rect::new(0, 0, 30, 5), None);
+        let first = index.focus_order[0];
+        let second = index.focus_order[1];
+        let mut state = RenderState {
+            stdout: stdout(),
+            prev: None,
+            nodes,
+            index,
+            focused: Some(first),
+            hovered: None,
+            mouse_down: None,
+            quit: QuitPolicy::None,
+        };
+
+        assert!(state.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)));
+
+        assert_eq!(&*calls.borrow(), &["raw"]);
+        assert_eq!(state.focused, Some(first));
+        assert_ne!(state.focused, Some(second));
         root.dispose();
     }
 
@@ -873,6 +956,25 @@ mod tests {
         assert!(
             output.contains("38;5;9m"),
             "changed red cell must emit its own foreground color: {output:?}"
+        );
+    }
+
+    #[test]
+    fn diff_skips_wide_char_trailing_cell() {
+        let mut prev = Canvas::empty(Rect::new(0, 0, 4, 1));
+        prev.set_text(Rect::new(0, 0, 4, 1), "  XY", SpanStyle::default());
+        let mut next = Canvas::empty(Rect::new(0, 0, 4, 1));
+        next.set_text(Rect::new(0, 0, 4, 1), "好XY", SpanStyle::default());
+
+        let mut out = Vec::new();
+        diff_and_draw(&mut out, &prev, &next).unwrap();
+        let output = String::from_utf8(out).unwrap();
+        let idx = output.find("好").expect("wide glyph emitted");
+        let after = &output[idx + "好".len()..];
+
+        assert!(
+            !after.starts_with("\x1b[1;2H "),
+            "diff repainted the wide glyph's trailing cell as a space: {output:?}"
         );
     }
 

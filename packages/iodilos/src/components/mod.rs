@@ -13,6 +13,11 @@
 use crate::node::{AsTuiNode, TuiNode};
 use crate::view::{View, ViewTuiNode};
 
+pub mod completion_menu;
+pub mod overlay_box;
+pub mod scroll_view;
+pub mod table_view;
+
 /// Construct a node for the given static tag string.
 fn element(tag: &'static str) -> TuiNode {
     TuiNode::create_element(std::borrow::Cow::Borrowed(tag))

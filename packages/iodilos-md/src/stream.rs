@@ -283,8 +283,8 @@ impl StreamingParser {
 fn absorb_streaming_table_rows(all: &mut Vec<Block>, committed_count: usize) {
     let mut i = committed_count;
     while i + 1 < all.len() {
-        let absorb = matches!(all[i], Block::Table(_))
-            && paragraph_is_streaming_table_row(&all[i + 1]);
+        let absorb =
+            matches!(all[i], Block::Table(_)) && paragraph_is_streaming_table_row(&all[i + 1]);
         if absorb {
             // `remove` shifts later blocks down by one; the block that lands
             // at i+1 may itself be another absorbable `|`-row (several data
@@ -635,8 +635,7 @@ mod tests {
         // makes the whole thing fail. Sticky should keep the failed tick
         // showing the last successful diagram instead of falling back to raw.
         let ok = "flowchart TD\n    A[Start] --> B{Ready?}\n    B -->|yes| C[Ship]";
-        let rendered_ok =
-            crate::mermaid::render(ok).expect("fixture: ok content renders");
+        let rendered_ok = crate::mermaid::render(ok).expect("fixture: ok content renders");
         assert!(
             crate::mermaid::render(&format!("{ok}\n    D[")).is_none(),
             "fixture: ok + unterminated node must fail"
@@ -702,8 +701,7 @@ mod tests {
             _ => None,
         });
         assert_eq!(
-            diagram,
-            None,
+            diagram, None,
             "closed/committed mermaid carries no sticky diagram — re-parse for real"
         );
     }
@@ -716,7 +714,10 @@ mod tests {
         let a = "flowchart TD\n    A[Start] --> B{Ready?}\n    B -->|yes| C[Ship]";
         let b = "flowchart TD\n    X --> Y\n    Z[";
         crate::mermaid::render(a).expect("fixture: a renders");
-        assert!(crate::mermaid::render(b).is_none(), "fixture: b fails to parse");
+        assert!(
+            crate::mermaid::render(b).is_none(),
+            "fixture: b fails to parse"
+        );
         let mut p = StreamingParser::new();
         // tick1: A open and parses → cache = A.
         p.feed(&format!("```mermaid\n{a}"));
@@ -815,8 +816,14 @@ mod tests {
             .flat_map(|r| r.segments.iter())
             .map(|s| s.content.as_ref())
             .collect();
-        assert!(text.contains('✔'), "checked item should use ✔, got: {text:?}");
-        assert!(text.contains('☐'), "unchecked item should use ☐, got: {text:?}");
+        assert!(
+            text.contains('✔'),
+            "checked item should use ✔, got: {text:?}"
+        );
+        assert!(
+            text.contains('☐'),
+            "unchecked item should use ☐, got: {text:?}"
+        );
         assert!(!text.contains("[x]"), "should not show raw [x]: {text:?}");
         assert!(!text.contains("[ ]"), "should not show raw [ ]: {text:?}");
     }

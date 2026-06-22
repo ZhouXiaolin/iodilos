@@ -1,8 +1,8 @@
 //! Pure rendering of the prompt box into a `TextSurface`.
 
+use iodilos::Color;
 use iodilos::surface::{TextRow, TextSegment, TextSurface};
 use iodilos::text::SpanStyle;
-use iodilos::Color;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::statusline::StatusLine;
@@ -63,7 +63,10 @@ pub fn render_prompt_to_surface(
             }
         }
         if content_width < cw {
-            segs.push(TextSegment::styled(" ".repeat(cw - content_width), SpanStyle::default()));
+            segs.push(TextSegment::styled(
+                " ".repeat(cw - content_width),
+                SpanStyle::default(),
+            ));
         }
         segs.push(TextSegment::styled(right, frame));
         rows.push(TextRow::from_segments(segs));
@@ -222,7 +225,13 @@ mod tests {
     use unicode_width::UnicodeWidthStr;
 
     fn render(buffer: &str, cursor: usize, width: usize) -> TextSurface {
-        render_prompt_to_surface(buffer, cursor, &StatusLine::default_mock(), width, &PromptTheme::default())
+        render_prompt_to_surface(
+            buffer,
+            cursor,
+            &StatusLine::default_mock(),
+            width,
+            &PromptTheme::default(),
+        )
     }
 
     fn row_text(s: &TextSurface, i: usize) -> String {
@@ -256,7 +265,10 @@ mod tests {
         assert!(top.ends_with("─╮"));
         assert!(bot.starts_with("╰─"));
         assert!(bot.ends_with("─╯"));
-        assert!(has_cursor_cell(&s, &theme), "empty buffer must show a cursor");
+        assert!(
+            has_cursor_cell(&s, &theme),
+            "empty buffer must show a cursor"
+        );
     }
 
     #[test]
@@ -308,6 +320,18 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn cjk_input_is_preserved_in_prompt_surface() {
+        let s = render("你好世界", 4, 30);
+        let body = row_text(&s, 1);
+
+        assert!(
+            body.contains("你好世界"),
+            "prompt body lost CJK text: {body:?}"
+        );
+        assert_eq!(row_width(&s, 1), 30);
     }
 
     #[test]

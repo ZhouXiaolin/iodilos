@@ -283,6 +283,9 @@ impl ViewTuiNode for TuiNode {
         Self::Marker { id: NodeId::next() }
     }
 
+    /// Construct a text-surface leaf carrying a `scroll` offset (rows hidden
+    /// above the visible window). The paint path clamps `scroll` to
+    /// `[0, total - visible_height]`, so a large value means "stick to bottom".
     fn create_text_surface_node(surface: TextSurface, scroll: i32) -> Self {
         Self::TextSurface {
             id: NodeId::next(),

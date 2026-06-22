@@ -712,11 +712,24 @@ fn paint_node(
         if let Some((surface, scroll)) = &node.surface {
             let width = node.rect.width as usize;
             let layout = surface.layout(width, text);
-            let scroll = (*scroll).max(0) as usize;
-            let visible_height = node.rect.height as usize;
             let clip_rect = intersect_rect(node.rect, clip).unwrap_or(PaintRect::ZERO);
+            // The on-screen window for this node is its clipped rect. The node's
+            // own `rect.height` is its *natural* content height (taffy does not
+            // shrink a child of an `overflow: hidden` parent), so the visible
+            // height is the clipped rect's height. Clamp `scroll` to
+            // `[0, total - visible_height]` so a large value means "stick to
+            // bottom": the caller passes a sentinel (e.g. `i32::MAX`) and the
+            // last `visible_height` rows land inside the clip without the caller
+            // having to know the viewport height. A scroll of 0 (and any in-range
+            // value) behaves exactly as before — `i < scroll` skips head rows and
+            // the clip_rect clips the tail.
+            let visible_height = clip_rect.height as usize;
+            let total = layout.rows().len();
+            let max_scroll = total.saturating_sub(visible_height);
+            let scroll = (*scroll).max(0) as usize;
+            let scroll = scroll.min(max_scroll);
             for (i, row) in layout.rows().iter().enumerate() {
-                if i < scroll || i >= scroll + visible_height {
+                if i < scroll {
                     continue;
                 }
                 let y = node.rect.y + (i - scroll) as i32;
@@ -1212,6 +1225,82 @@ mod tests {
         assert!(
             !painted.contains("line 1"),
             "scrolled-off head (line 1) should be clipped: {painted}"
+        );
+        root.dispose();
+    }
+
+    /// A text-surface leaf with a large `scroll` value must clamp to the bottom
+    /// of its content: only the last `visible_height` rows paint, even though
+    /// the surface carries more. This is the layout-driven "stick to bottom"
+    /// path the transcript relies on — the component passes a sentinel scroll
+    /// and the paint path resolves the real window from taffy's height.
+    #[test]
+    fn text_surface_with_large_scroll_sticks_to_bottom() {
+        use crate::surface::TextSurface;
+        use crate::view::ViewTuiNode;
+        let mut nodes = Vec::new();
+        let root = create_root(|| {
+            // A 4-tall viewport whose child surface holds 5 lines and a sentinel
+            // scroll (i32::MAX). Only lines 1..4 should paint; line 0 is above
+            // the clamped window.
+            let surface = TextSurface::from_text("line 0\nline 1\nline 2\nline 3\nline 4");
+            let view: View = tags::div()
+                .width(10)
+                .height(4)
+                .overflow(taffy::style::Overflow::Hidden)
+                .children(View::from_node(TuiNode::create_text_surface_node(
+                    surface,
+                    i32::MAX,
+                )))
+                .into();
+            nodes = view.nodes.into_iter().collect();
+        });
+        let (canvas, _index) = render(&nodes, Rect::new(0, 0, 12, 6), None);
+        let painted = canvas_to_plain_text(&canvas);
+        assert!(
+            painted.contains("line 4"),
+            "stick-to-bottom must show the last line: {painted}"
+        );
+        assert!(
+            painted.contains("line 3"),
+            "stick-to-bottom must show the second-to-last line: {painted}"
+        );
+        assert!(
+            !painted.contains("line 0"),
+            "stick-to-bottom must clip the first line: {painted}"
+        );
+        root.dispose();
+    }
+
+    /// A `scroll` of 0 keeps the existing behaviour (paint from the top), so a
+    /// surface taller than its viewport clips the BOTTOM, not the head. This
+    /// guards the backward-compatibility of the scroll clamp.
+    #[test]
+    fn text_surface_with_zero_scroll_shows_from_top() {
+        use crate::surface::TextSurface;
+        use crate::view::ViewTuiNode;
+        let mut nodes = Vec::new();
+        let root = create_root(|| {
+            let surface = TextSurface::from_text("line 0\nline 1\nline 2\nline 3\nline 4");
+            let view: View = tags::div()
+                .width(10)
+                .height(4)
+                .overflow(taffy::style::Overflow::Hidden)
+                .children(View::from_node(TuiNode::create_text_surface_node(
+                    surface, 0,
+                )))
+                .into();
+            nodes = view.nodes.into_iter().collect();
+        });
+        let (canvas, _index) = render(&nodes, Rect::new(0, 0, 12, 6), None);
+        let painted = canvas_to_plain_text(&canvas);
+        assert!(
+            painted.contains("line 0"),
+            "scroll 0 shows the first line: {painted}"
+        );
+        assert!(
+            !painted.contains("line 4"),
+            "scroll 0 clips the last line: {painted}"
         );
         root.dispose();
     }

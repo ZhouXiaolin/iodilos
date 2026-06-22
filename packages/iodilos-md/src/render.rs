@@ -532,7 +532,7 @@ fn fit_segments_to_width(segments: Vec<TextSegment>, target_width: usize) -> Vec
     out
 }
 
-fn render_table(table: &Table, _width: usize, theme: &MarkdownTheme, out: &mut Vec<TextRow>) {
+fn render_table(table: &Table, width: usize, theme: &MarkdownTheme, out: &mut Vec<TextRow>) {
     use pulldown_cmark::Alignment;
     let col_count = table
         .headers
@@ -541,6 +541,7 @@ fn render_table(table: &Table, _width: usize, theme: &MarkdownTheme, out: &mut V
     if col_count == 0 {
         return;
     }
+    // Natural column widths = widest cell in each column.
     let mut widths = vec![0usize; col_count];
     for (i, h) in table.headers.iter().enumerate() {
         widths[i] = widths[i].max(display_width(h));
@@ -552,6 +553,12 @@ fn render_table(table: &Table, _width: usize, theme: &MarkdownTheme, out: &mut V
             }
         }
     }
+    // Fit the table to `width`: total = Σ(widths[i] + 2 padding) + (col_count+1)
+    // bars. If it overflows, shrink columns proportionally (each kept ≥ 1) so
+    // long cells wrap inside their cell instead of blowing the frame past the
+    // terminal. This keeps the table shape intact on resize.
+    widths = fit_column_widths(&widths, width);
+
     let border_style = SpanStyle {
         fg: Some(theme.table_border),
         ..SpanStyle::default()
@@ -564,18 +571,32 @@ fn render_table(table: &Table, _width: usize, theme: &MarkdownTheme, out: &mut V
     };
     out.push(table_rule("┌", "─", "┬", "┐", &widths, border_style));
 
+    // Render one logical row (header or data). Each cell is word-wrapped to its
+    // column width; cells in the same row are padded to the tallest so the bar
+    // on the right lines up across every visual line of the row.
     let push_row = |out: &mut Vec<TextRow>, cells: &[String], style: SpanStyle| {
-        let mut spans = vec![bar.clone()];
-        for (i, w) in widths.iter().enumerate() {
-            let content = cells.get(i).map(String::as_str).unwrap_or("");
-            let align = table.aligns.get(i).copied().unwrap_or(Alignment::Left);
-            let padded = pad_cell(content, *w, align);
-            spans.push(TextSegment::raw(" "));
-            spans.push(TextSegment::styled(padded, style));
-            spans.push(TextSegment::raw(" "));
-            spans.push(bar.clone());
+        let wrapped: Vec<Vec<String>> = (0..col_count)
+            .map(|i| {
+                let content = cells.get(i).map(String::as_str).unwrap_or("");
+                wrap_cell(content, widths[i])
+            })
+            .collect();
+        let max_lines = wrapped.iter().map(Vec::len).max().unwrap_or(1);
+        let aligns: Vec<Alignment> = (0..col_count)
+            .map(|i| table.aligns.get(i).copied().unwrap_or(Alignment::Left))
+            .collect();
+        for line_idx in 0..max_lines {
+            let mut spans = vec![bar.clone()];
+            for i in 0..col_count {
+                let cell_line = wrapped[i].get(line_idx).map(String::as_str).unwrap_or("");
+                let padded = pad_cell(cell_line, widths[i], aligns[i]);
+                spans.push(TextSegment::raw(" "));
+                spans.push(TextSegment::styled(padded, style));
+                spans.push(TextSegment::raw(" "));
+                spans.push(bar.clone());
+            }
+            out.push(TextRow::from(spans));
         }
-        out.push(TextRow::from(spans));
     };
     push_row(out, &table.headers, header_style);
     // Header/body separator row (╞══╪══╡), aligned to the column widths so the
@@ -592,6 +613,118 @@ fn render_table(table: &Table, _width: usize, theme: &MarkdownTheme, out: &mut V
         push_row(out, row, SpanStyle::default());
     }
     out.push(table_rule("└", "─", "┴", "┘", &widths, border_style));
+}
+
+/// The rendered width of a table given its column `widths`: each column costs
+/// its content width + 2 padding cells, plus one `│` bar per column boundary.
+fn table_total_width(widths: &[usize]) -> usize {
+    widths.iter().map(|w| w + 2).sum::<usize>() + widths.len() + 1
+}
+
+/// Shrink `natural` column widths so the table fits in `width` cells, keeping
+/// each column ≥ 1. Columns that already fit are returned unchanged. Shrinking
+/// is proportional to the natural width so wide columns give up more cells
+/// than narrow ones. The result never exceeds `width` (when `width` is large
+/// enough to hold the natural table, the natural widths are returned as-is —
+/// we do not stretch columns to fill the terminal).
+fn fit_column_widths(natural: &[usize], width: usize) -> Vec<usize> {
+    let cols = natural.len();
+    if cols == 0 {
+        return Vec::new();
+    }
+    let total = table_total_width(natural);
+    if total <= width {
+        return natural.to_vec();
+    }
+    // Budget for column content = width minus the fixed chrome (bars + padding).
+    // chrome = (cols + 1) bars + 2 padding * cols.
+    let chrome = (cols + 1) + 2 * cols;
+    let target = width.saturating_sub(chrome).max(cols); // ≥ 1 per column
+    // Iteratively reclaim: while the sum exceeds the target and some column is
+    // still > 1, shave one cell off the widest column. This converges and keeps
+    // every column ≥ 1, distributing the shrink to whichever column is widest
+    // at each step (proportional in effect).
+    let mut w = natural.to_vec();
+    while w.iter().sum::<usize>() > target && w.iter().any(|&c| c > 1) {
+        // Find the widest column (first one on ties) and shrink it.
+        let idx = w
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, c)| **c)
+            .map(|(i, _)| i)
+            .expect("at least one column > 1");
+        w[idx] -= 1;
+    }
+    w
+}
+
+/// Word-wrap a cell's text to `width` cells, breaking at spaces when possible
+/// and hard-breaking any single token longer than `width`. Returns one or more
+/// lines (never empty: an empty cell yields a single empty line).
+fn wrap_cell(content: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut lines = Vec::new();
+    for source_line in content.split('\n') {
+        if source_line.is_empty() {
+            lines.push(String::new());
+            continue;
+        }
+        let mut current = String::new();
+        let mut col = 0usize;
+        for word in source_line.split_whitespace() {
+            let word_w = display_width(word);
+            // A word that itself exceeds the width hard-breaks char-by-char.
+            if word_w > width {
+                // Flush whatever is pending onto its own line first.
+                if !current.is_empty() {
+                    lines.push(std::mem::take(&mut current));
+                    col = 0;
+                }
+                let mut rest = word;
+                while display_width(rest) > width {
+                    let (head, tail) = split_at_width(rest, width);
+                    lines.push(head.to_string());
+                    rest = tail;
+                }
+                if !rest.is_empty() {
+                    current.push_str(rest);
+                    col = display_width(rest);
+                }
+                continue;
+            }
+            let sep = if current.is_empty() { 0 } else { 1 };
+            if col + sep + word_w > width && !current.is_empty() {
+                lines.push(std::mem::take(&mut current));
+                current.push_str(word);
+                col = word_w;
+            } else {
+                if sep == 1 {
+                    current.push(' ');
+                }
+                current.push_str(word);
+                col += sep + word_w;
+            }
+        }
+        lines.push(current);
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
+}
+
+/// Split `s` at `width` display cells, returning `(head, tail)` on a character
+/// boundary (never splitting a wide char). `head` measures exactly ≤ `width`.
+fn split_at_width(s: &str, width: usize) -> (&str, &str) {
+    let mut used = 0usize;
+    for (i, ch) in s.char_indices() {
+        let cw = UnicodeWidthChar::width(ch).unwrap_or(0).max(1);
+        if used + cw > width {
+            return (&s[..i], &s[i..]);
+        }
+        used += cw;
+    }
+    (s, "")
 }
 
 fn table_rule(
@@ -933,6 +1066,85 @@ mod tests {
             widths.iter().all(|w| *w == widths[0]),
             "table frame rows should align: {texts:?}"
         );
+    }
+
+    #[test]
+    fn table_never_overflows_render_width() {
+        // A long cell that would naturally exceed the terminal width must be
+        // shrunk/wrapped so every rendered row fits inside `width`.
+        let theme = MarkdownTheme::default();
+        let src = "| name | description |\n|------|--------------|\n| alpha | this is a very long description that would blow past a narrow terminal width |\n";
+        let width = 30;
+        let lines = render_to_surface(src, width, &theme);
+        let widths = row_widths(&lines);
+        let max = *widths.iter().max().unwrap_or(&0);
+        assert!(
+            max <= width,
+            "every table row must fit in width {width}, but a row was {max} cells wide: {:?}",
+            lines.rows().iter().map(row_text).collect::<Vec<_>>()
+        );
+        // The long content must still be present (wrapped, not truncated).
+        let joined: String = lines
+            .iter()
+            .flat_map(|l| l.segments.iter())
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(
+            joined.contains("long") && joined.contains("description"),
+            "wrapped content should still be present: {joined}"
+        );
+    }
+
+    #[test]
+    fn table_keeps_frame_shape_when_wrapping() {
+        // When cells wrap to multiple visual lines, the frame stays rectangular:
+        // every row still starts with │ and ends with │, and the top/bottom
+        // rules are present and closed.
+        let theme = MarkdownTheme::default();
+        let src = "| a | b |\n|---|---|\n| short | a considerably longer cell value |\n";
+        let lines = render_to_surface(src, 24, &theme);
+        let texts: Vec<String> = lines.rows().iter().map(row_text).collect();
+        let first = texts.first().cloned().unwrap_or_default();
+        let last = texts.last().cloned().unwrap_or_default();
+        assert!(first.starts_with('┌') && first.ends_with('┐'), "top rule: {first:?}");
+        assert!(last.starts_with('└') && last.ends_with('┘'), "bottom rule: {last:?}");
+        for (i, t) in texts.iter().enumerate() {
+            if i == 0 || i == texts.len() - 1 {
+                continue;
+            }
+            // Skip the horizontal separator rule rows (they use ─/═/┼, not │…│).
+            if t.contains('─') || t.contains('═') {
+                continue;
+            }
+            assert!(t.starts_with('│'), "data row must start with bar: {t:?}");
+            assert!(t.ends_with('│'), "data row must end with bar: {t:?}");
+        }
+    }
+
+    #[test]
+    fn table_shrinks_columns_when_width_too_small() {
+        // Direct unit test for the column-width fitter: a table whose natural
+        // width overflows `width` gets every column shrunk so the total fits.
+        let natural = vec![20usize, 30];
+        let fitted = fit_column_widths(&natural, 24);
+        let total = table_total_width(&fitted);
+        assert!(
+            total <= 24,
+            "fitted table total {total} must fit in 24: {fitted:?}"
+        );
+        assert!(
+            fitted.iter().all(|&w| w >= 1),
+            "every column kept ≥ 1: {fitted:?}"
+        );
+    }
+
+    #[test]
+    fn table_fit_leaves_natural_widths_when_they_fit() {
+        // When the terminal is wide enough, the natural widths are returned
+        // unchanged (no stretching to fill the width).
+        let natural = vec![3usize, 4];
+        let fitted = fit_column_widths(&natural, 80);
+        assert_eq!(fitted, natural, "natural widths preserved when they fit");
     }
 
     #[test]

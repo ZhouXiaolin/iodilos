@@ -33,10 +33,9 @@
 //! until a blank line arrives — the last row/line of such a block simply
 //! re-renders each tick, which is the desired streaming behavior.
 
-use iodilos::surface::TextSurface;
-
 use crate::parser::{Block, parse};
 use crate::render::{inlines_to_string, render_blocks_to_surface};
+use iodilos::producer::Lines;
 use crate::theme::MarkdownTheme;
 
 /// A stateful, append-only streaming Markdown parser.
@@ -144,7 +143,7 @@ impl StreamingParser {
     }
 
     /// Feed the full current source, render the resulting blocks to a
-    /// `TextSurface` at `width`, and return it. The committed prefix is parsed
+    /// `Lines` at `width`, and return it. The committed prefix is parsed
     /// incrementally; only the open tail is re-parsed each call (see [`feed`](Self::feed)).
     /// The block→surface conversion is whole-rebuild per call (committed-prefix
     /// surface caching is deferred).
@@ -153,7 +152,7 @@ impl StreamingParser {
         src: &str,
         width: usize,
         theme: &MarkdownTheme,
-    ) -> TextSurface {
+    ) -> Lines {
         let blocks = self.feed(src);
         render_blocks_to_surface(&blocks, width, theme)
     }
@@ -605,9 +604,10 @@ mod tests {
         // tick 1: a committed paragraph + an open tail paragraph
         let l1 = p.feed_to_surface("intro\n\nunfinished", 60, &theme);
         let joined: String = l1
+            .rows
             .iter()
-            .flat_map(|l| l.segments.iter())
-            .map(|s| s.content.as_ref().to_string())
+            .flat_map(|l| l.iter())
+            .map(|s| s.0.as_str().to_string())
             .collect();
         assert!(
             joined.contains("intro"),
@@ -762,7 +762,7 @@ mod tests {
         for end in 1..=chars.len() {
             let chunk: String = chars[..end].iter().collect();
             let surface = p.feed_to_surface(&chunk, width, &theme);
-            let total = surface.row_count();
+            let total = surface.rows.len();
             if total < prev_total {
                 let snippet: String = chars[end.saturating_sub(12)..end].iter().collect();
                 recessions.push(format!("end={end} {prev_total}→{total} …{snippet:?}"));
@@ -788,9 +788,9 @@ mod tests {
         let theme = crate::MarkdownTheme::default();
         let surface = crate::render::render_blocks_to_surface(&blocks, 40, &theme);
         let rows: Vec<String> = surface
-            .rows()
+            .rows
             .iter()
-            .map(|r| r.segments.iter().map(|s| s.content.as_ref()).collect())
+            .map(|r| r.iter().map(|s| s.0.as_str()).collect())
             .collect();
         let has_inner_rule = rows
             .iter()
@@ -811,10 +811,10 @@ mod tests {
         let theme = crate::MarkdownTheme::default();
         let surface = crate::render::render_blocks_to_surface(&blocks, 40, &theme);
         let text: String = surface
-            .rows()
+            .rows
             .iter()
-            .flat_map(|r| r.segments.iter())
-            .map(|s| s.content.as_ref())
+            .flat_map(|r| r.iter())
+            .map(|s| s.0.as_str())
             .collect();
         assert!(
             text.contains('✔'),
@@ -866,7 +866,7 @@ mod tests {
             let chunk: String = chars[..end].iter().collect();
             let blocks = p.feed(&chunk);
             let surface = crate::render::render_blocks_to_surface(&blocks, 40, &theme);
-            let total = surface.row_count();
+            let total = surface.rows.len();
             if total != prev {
                 let k: Vec<String> = blocks
                     .iter()
@@ -897,8 +897,8 @@ mod tests {
         let theme = crate::MarkdownTheme::default();
         let surface = crate::render::render_blocks_to_surface(&blocks, 40, &theme);
         eprintln!("--- full table render ---");
-        for (i, row) in surface.rows().iter().enumerate() {
-            let text: String = row.segments.iter().map(|s| s.content.as_ref()).collect();
+        for (i, row) in surface.rows.iter().enumerate() {
+            let text: String = row.iter().map(|s| s.0.as_str()).collect();
             eprintln!("{i:2}|{text}");
         }
     }
@@ -913,8 +913,8 @@ mod tests {
         let theme = crate::MarkdownTheme::default();
         let surface = crate::render::render_blocks_to_surface(&blocks, 36, &theme);
         eprintln!("--- task list render ---");
-        for (i, row) in surface.rows().iter().enumerate() {
-            let text: String = row.segments.iter().map(|s| s.content.as_ref()).collect();
+        for (i, row) in surface.rows.iter().enumerate() {
+            let text: String = row.iter().map(|s| s.0.as_str()).collect();
             eprintln!("{i:2}|{text}|");
         }
     }

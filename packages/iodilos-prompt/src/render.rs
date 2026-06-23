@@ -1,8 +1,8 @@
-//! Pure rendering of the prompt box into a `TextSurface`.
+//! Pure rendering of the prompt box into a `Lines` producer.
 
-use iodilos::Color;
-use iodilos::surface::{TextRow, TextSegment, TextSurface};
+use iodilos::producer::Lines;
 use iodilos::text::SpanStyle;
+use iodilos::Color;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::statusline::StatusLine;
@@ -16,7 +16,7 @@ const BOT_LEFT: &str = "╰─";
 const BOT_RIGHT: &str = "─╯";
 
 /// Render the prompt (statusline top border + framed multiline input) into a
-/// `TextSurface` exactly `width` cells wide. The cursor is drawn as a
+/// `Lines` producer exactly `width` cells wide. The cursor is drawn as a
 /// self-contained block cell (covering the char under it, or a space at EOL).
 pub fn render_prompt_to_surface(
     buffer: &str,
@@ -24,7 +24,7 @@ pub fn render_prompt_to_surface(
     statusline: &StatusLine,
     width: usize,
     theme: &PromptTheme,
-) -> TextSurface {
+) -> Lines {
     let width = width.max(6); // keep both brackets + ≥2 content cells
     let cw = width.saturating_sub(4).max(1); // content width inside the frame
     let frame = fg(theme.frame);
@@ -35,7 +35,7 @@ pub fn render_prompt_to_surface(
         ..SpanStyle::default()
     };
 
-    let mut rows: Vec<TextRow> = Vec::new();
+    let mut rows: Vec<Vec<(String, SpanStyle)>> = Vec::new();
     rows.push(top_row(statusline, cw, &frame, theme));
     for line in input_lines(buffer, cursor_char, cw) {
         let (left, right) = if line.is_last {
@@ -43,35 +43,35 @@ pub fn render_prompt_to_surface(
         } else {
             (MID_LEFT, MID_RIGHT)
         };
-        let mut segs: Vec<TextSegment> = Vec::new();
-        segs.push(TextSegment::styled(left, frame));
+        let mut segs: Vec<(String, SpanStyle)> = Vec::new();
+        segs.push((left.to_string(), frame));
         let mut content_width = 0usize;
         for cell in &line.cells {
             match cell {
                 Cell::Char(ch) => {
-                    segs.push(TextSegment::styled(ch.to_string(), text));
+                    segs.push((ch.to_string(), text));
                     content_width += char_width(*ch);
                 }
                 Cell::Covered(ch) => {
-                    segs.push(TextSegment::styled(ch.to_string(), cursor));
+                    segs.push((ch.to_string(), cursor));
                     content_width += char_width(*ch);
                 }
                 Cell::CursorBlock => {
-                    segs.push(TextSegment::styled(" ", cursor));
+                    segs.push((" ".to_string(), cursor));
                     content_width += 1;
                 }
             }
         }
         if content_width < cw {
-            segs.push(TextSegment::styled(
+            segs.push((
                 " ".repeat(cw - content_width),
                 SpanStyle::default(),
             ));
         }
-        segs.push(TextSegment::styled(right, frame));
-        rows.push(TextRow::from_segments(segs));
+        segs.push((right.to_string(), frame));
+        rows.push(segs);
     }
-    TextSurface::from_rows(rows)
+    Lines::new(rows)
 }
 
 fn fg(color: Color) -> SpanStyle {
@@ -169,41 +169,46 @@ fn input_lines(buffer: &str, cursor: usize, cw: usize) -> Vec<InputLine> {
 
 // --- top (statusline) row ---
 
-fn top_row(statusline: &StatusLine, cw: usize, frame: &SpanStyle, theme: &PromptTheme) -> TextRow {
+fn top_row(
+    statusline: &StatusLine,
+    cw: usize,
+    frame: &SpanStyle,
+    theme: &PromptTheme,
+) -> Vec<(String, SpanStyle)> {
     let mut content = statusline_segments(statusline, theme);
     truncate_to_width(&mut content, cw);
     let used = segments_width(&content);
     if used < cw {
-        content.push(TextSegment::styled("─".repeat(cw - used), *frame));
+        content.push(("─".repeat(cw - used), *frame));
     }
     let mut segs = Vec::with_capacity(content.len() + 2);
-    segs.push(TextSegment::styled(TOP_LEFT, *frame));
+    segs.push((TOP_LEFT.to_string(), *frame));
     segs.extend(content);
-    segs.push(TextSegment::styled(TOP_RIGHT, *frame));
-    TextRow::from_segments(segs)
-}
-
-fn statusline_segments(sl: &StatusLine, theme: &PromptTheme) -> Vec<TextSegment> {
-    let dim = fg(theme.separator);
-    let mut segs = Vec::new();
-    segs.push(TextSegment::styled(sl.brand.clone(), fg(sl.brand_color)));
-    for f in &sl.fields {
-        let fs = fg(f.color);
-        segs.push(TextSegment::styled(" > ", dim));
-        segs.push(TextSegment::styled(f.icon.clone(), fs));
-        segs.push(TextSegment::styled(" ", fs));
-        segs.push(TextSegment::styled(f.text.clone(), fs));
-    }
-    segs.push(TextSegment::styled(" ", dim));
-    segs.push(TextSegment::styled(sl.tail.clone(), fg(sl.tail_color)));
+    segs.push((TOP_RIGHT.to_string(), *frame));
     segs
 }
 
-fn truncate_to_width(segs: &mut Vec<TextSegment>, maxw: usize) {
+fn statusline_segments(sl: &StatusLine, theme: &PromptTheme) -> Vec<(String, SpanStyle)> {
+    let dim = fg(theme.separator);
+    let mut segs = Vec::new();
+    segs.push((sl.brand.to_string(), fg(sl.brand_color)));
+    for f in &sl.fields {
+        let fs = fg(f.color);
+        segs.push((" > ".to_string(), dim));
+        segs.push((f.icon.to_string(), fs));
+        segs.push((" ".to_string(), fs));
+        segs.push((f.text.to_string(), fs));
+    }
+    segs.push((" ".to_string(), dim));
+    segs.push((sl.tail.to_string(), fg(sl.tail_color)));
+    segs
+}
+
+fn truncate_to_width(segs: &mut Vec<(String, SpanStyle)>, maxw: usize) {
     let mut acc = 0usize;
     let mut keep = segs.len();
     for (i, s) in segs.iter().enumerate() {
-        let w = UnicodeWidthStr::width(s.content.as_ref());
+        let w = UnicodeWidthStr::width(s.0.as_str());
         if acc + w > maxw {
             keep = i;
             break;
@@ -213,9 +218,9 @@ fn truncate_to_width(segs: &mut Vec<TextSegment>, maxw: usize) {
     segs.truncate(keep);
 }
 
-fn segments_width(segs: &[TextSegment]) -> usize {
+fn segments_width(segs: &[(String, SpanStyle)]) -> usize {
     segs.iter()
-        .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+        .map(|s| UnicodeWidthStr::width(s.0.as_str()))
         .sum()
 }
 
@@ -224,7 +229,7 @@ mod tests {
     use super::*;
     use unicode_width::UnicodeWidthStr;
 
-    fn render(buffer: &str, cursor: usize, width: usize) -> TextSurface {
+    fn render(buffer: &str, cursor: usize, width: usize) -> Lines {
         render_prompt_to_surface(
             buffer,
             cursor,
@@ -234,23 +239,21 @@ mod tests {
         )
     }
 
-    fn row_text(s: &TextSurface, i: usize) -> String {
-        s.rows()[i]
-            .segments
+    fn row_text(s: &Lines, i: usize) -> String {
+        s.rows[i]
             .iter()
-            .map(|x| x.content.as_ref().to_string())
+            .map(|x| x.0.as_str())
             .collect()
     }
 
-    fn row_width(s: &TextSurface, i: usize) -> usize {
+    fn row_width(s: &Lines, i: usize) -> usize {
         UnicodeWidthStr::width(row_text(s, i).as_str())
     }
 
-    fn has_cursor_cell(s: &TextSurface, theme: &PromptTheme) -> bool {
-        s.rows().iter().any(|r| {
-            r.segments
-                .iter()
-                .any(|x| x.style.bg == Some(theme.cursor_bg))
+    fn has_cursor_cell(s: &Lines, theme: &PromptTheme) -> bool {
+        s.rows.iter().any(|r| {
+            r.iter()
+                .any(|x| x.1.bg == Some(theme.cursor_bg))
         })
     }
 
@@ -258,7 +261,7 @@ mod tests {
     fn empty_buffer_is_two_rows_top_and_bottom() {
         let theme = PromptTheme::default();
         let s = render("", 0, 60);
-        assert_eq!(s.row_count(), 2);
+        assert_eq!(s.rows.len(), 2);
         let top = row_text(&s, 0);
         let bot = row_text(&s, 1);
         assert!(top.starts_with("╭─"));
@@ -274,7 +277,7 @@ mod tests {
     #[test]
     fn single_line_input_uses_bottom_brackets() {
         let s = render("hello", 5, 60);
-        assert_eq!(s.row_count(), 2);
+        assert_eq!(s.rows.len(), 2);
         assert!(row_text(&s, 1).contains("hello"));
         assert!(row_text(&s, 1).starts_with("╰─"));
         assert!(row_text(&s, 1).ends_with("─╯"));
@@ -283,7 +286,7 @@ mod tests {
     #[test]
     fn multiline_uses_side_walls_then_bottom() {
         let s = render("aa\nbb", 5, 60);
-        assert_eq!(s.row_count(), 3);
+        assert_eq!(s.rows.len(), 3);
         assert!(row_text(&s, 1).starts_with("│ "));
         assert!(row_text(&s, 1).ends_with(" │"));
         assert!(row_text(&s, 2).starts_with("╰─"));
@@ -294,7 +297,7 @@ mod tests {
     fn soft_wrap_produces_side_walls_then_bottom() {
         // width 12 -> cw 8; "abcdefghijkl" (12 chars) wraps to two lines of 8 then 4.
         let s = render("abcdefghijkl", 12, 12);
-        assert_eq!(s.row_count(), 3); // top + 2 input lines
+        assert_eq!(s.rows.len(), 3); // top + 2 input lines
         assert!(row_text(&s, 1).starts_with("│ "));
         assert!(row_text(&s, 2).starts_with("╰─"));
         assert!(row_text(&s, 1).contains("abcdefgh"));
@@ -312,7 +315,7 @@ mod tests {
             ("🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀", 5, 20),
         ] {
             let s = render(buf, cur, w);
-            for i in 0..s.row_count() {
+            for i in 0..s.rows.len() {
                 assert!(
                     row_width(&s, i) <= w,
                     "row {i} width {} > {w} for buf={buf:?}",
@@ -345,7 +348,7 @@ mod tests {
     fn cursor_wraps_when_trailing_block_overflows_line() {
         // cw 2; "ab" at EOF -> trailing cursor block wraps to a new bottom line.
         let s = render("ab", 2, 6);
-        assert_eq!(s.row_count(), 3); // top + "ab" + cursor line
+        assert_eq!(s.rows.len(), 3); // top + "ab" + cursor line
         assert!(row_text(&s, 1).starts_with("│ "));
         assert!(row_text(&s, 2).starts_with("╰─"));
     }
@@ -371,7 +374,7 @@ mod tests {
                 ("你好世界 test 你好", 3usize),
             ] {
                 let s = render(buf, cur, w);
-                for i in 0..s.row_count() {
+                for i in 0..s.rows.len() {
                     let txt = row_text(&s, i);
                     let rw = row_width(&s, i);
                     assert_eq!(rw, w, "width={w} buf={buf:?} row{i} rw={rw} txt={txt:?}");

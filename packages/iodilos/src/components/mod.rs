@@ -14,8 +14,10 @@ use crate::node::{AsTuiNode, TuiNode};
 use crate::view::{View, ViewTuiNode};
 
 pub mod completion_menu;
+pub mod iter;
 pub mod overlay_box;
 pub mod scroll_view;
+pub mod show;
 pub mod table_view;
 
 /// Construct a node for the given static tag string.
@@ -111,11 +113,11 @@ mod tests {
         assert_eq!(node.attribute_value("id").as_deref(), Some("save"));
         assert_eq!(element.children.len(), 1);
 
-        let TuiNode::TextSurface { surface, .. } = &element.children[0] else {
-            panic!("text child should now be a TextSurface node");
+        let TuiNode::Leaf { producer, .. } = &element.children[0] else {
+            panic!("text child should now be a Leaf node");
         };
-        let surface = surface.borrow();
-        assert_eq!(surface.row_count(), 1, "one row for \"Save\"");
-        assert_eq!(surface.plain_text(), "Save");
+        let p = producer.borrow();
+        assert_eq!(p.measure(10), 1, "one row for \"Save\"");
+        assert_eq!(p.plain_text(), "Save");
     }
 }

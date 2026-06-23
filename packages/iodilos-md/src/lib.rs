@@ -21,11 +21,11 @@ pub use render::{render_blocks_to_surface, render_to_surface};
 pub use stream::StreamingParser;
 pub use theme::MarkdownTheme;
 
-use iodilos::surface::TextSurface;
+use iodilos::producer::Lines;
 use iodilos::view::View;
 
 /// Render Markdown source into a text surface at `width` (cells), themed.
-pub fn markdown_surface(src: &str, width: usize, theme: &MarkdownTheme) -> TextSurface {
+pub fn markdown_surface(src: &str, width: usize, theme: &MarkdownTheme) -> Lines {
     render_to_surface(src, width, theme)
 }
 
@@ -33,7 +33,7 @@ pub fn markdown_surface(src: &str, width: usize, theme: &MarkdownTheme) -> TextS
 /// The caller wraps this in an `overflow: hidden` div and drives the surface's
 /// offset for scrolling.
 pub fn markdown(src: &str, width: usize) -> View {
-    View::text_surface(markdown_surface(src, width, &MarkdownTheme::default()))
+    View::leaf(Box::new(markdown_surface(src, width, &MarkdownTheme::default())))
 }
 
 #[cfg(test)]
@@ -45,8 +45,8 @@ mod tests {
         let view = markdown("# hi", 40);
         let node = &view.nodes()[0];
         let row_count = match node {
-            iodilos::node::TuiNode::TextSurface { surface, .. } => surface.borrow().row_count(),
-            _ => panic!("expected TextSurface, got {node:?}"),
+            iodilos::node::TuiNode::Leaf { producer, .. } => producer.borrow().measure(40),
+            _ => panic!("expected Leaf, got {node:?}"),
         };
         assert!(row_count >= 1);
     }

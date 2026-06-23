@@ -463,6 +463,8 @@ pub struct Style {
     pub left: Inset,
 
     // --- border / background / text paint (do NOT inherit) ---
+    /// `z_index` (default 0). Higher values paint on top.
+    pub z_index: i32,
     /// `border_style`.
     pub border_style: BorderStyle,
     /// `border_color`.

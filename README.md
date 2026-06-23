@@ -4,14 +4,14 @@ A standalone reactive terminal UI library (reactive primitives derived from
 Sycamore). Two component libraries are being prepared for the **flown** project:
 
 - **Reactive core** — signals, memos, effects with automatic dependency tracking
-- **Canvas renderer** — frame-diffing ANSI output via crossterm, minimal writes
-- **TextSurface** — flat line-buffer text primitive with per-span styling
+- **Framebuffer renderer** — Cell-based framebuffer with frame-diffing ANSI output via crossterm, minimal writes
+- **Cell producers** — two-phase leaf model (`Plain` char-wrap, `Lines` pre-wrapped styled runs) that shape content into Cell rows at layout time
 - **Flexbox layout** — powered by taffy
 - **`view!` macro** — declarative UI DSL
 
 ## iodilos-md — streaming Markdown
 
-Parses Markdown (`pulldown-cmark`) into a `TextSurface` — syntax highlighting
+Parses Markdown into a `Lines` producer (pre-wrapped styled runs) — syntax highlighting
 via `syntect`, inline LaTeX via `unicodeit`, Mermaid flowcharts via `mmdflux`.
 Driven from a `Signal<String>` + width signal:
 

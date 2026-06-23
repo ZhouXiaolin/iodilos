@@ -1,8 +1,6 @@
-//! Terminal text styling primitives used by the surface painter.
-//!
-//! These types intentionally mirror ratatui's style semantics where useful, but
-//! they are not the document model. `surface` owns the row/segment abstraction
-//! that components paint through.
+//! Terminal text styling primitives: colors and modifier bitflags for [`Cell`]
+//! glyphs. Every glyph on the framebuffer carries a [`SpanStyle`] that the
+//! renderer's `render_row` emits as SGR codes.
 
 use bitflags::bitflags;
 use crossterm::style::Color;
@@ -59,18 +57,6 @@ impl SpanStyle {
     }
 }
 
-/// Horizontal alignment of a surface row within its area.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Alignment {
-    /// Left-aligned (the default).
-    #[default]
-    Left,
-    /// Centered.
-    Center,
-    /// Right-aligned.
-    Right,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -111,8 +97,4 @@ mod tests {
         assert_eq!(p.bg, Some(Color::Green));
     }
 
-    #[test]
-    fn alignment_default_is_left() {
-        assert_eq!(Alignment::default(), Alignment::Left);
-    }
 }

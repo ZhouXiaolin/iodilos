@@ -10,8 +10,8 @@ use crate::reactive::create_effect;
 
 use crate::attributes::{BoolAttribute, StringAttribute};
 use crate::events::Event;
+use crate::producer::{CellProducer, Plain};
 use crate::style::Style;
-use crate::surface::TextSurface;
 use crate::view::{View, ViewNode, ViewTuiNode};
 
 static NEXT_NODE_ID: AtomicU64 = AtomicU64::new(1);
@@ -40,11 +40,25 @@ pub(crate) type SharedHandler = Rc<RefCell<BoxedHandler>>;
 pub trait StylePropValue {
     /// Apply this value to the relevant field of `style`.
     fn apply(&self, style: &mut Style);
+    /// Clone the property into a new boxed trait object. Required so that
+    /// `Box<dyn StylePropValue>` (and thus [`StyleProp`], [`ElementNode`],
+    /// [`TuiNode`], and [`View`](crate::View)) can be `Clone` — which the
+    /// `Indexed`/`Keyed` engines (`map_indexed`/`map_keyed`) require.
+    fn clone_box(&self) -> Box<dyn StylePropValue>;
 }
 
 impl StylePropValue for Box<dyn StylePropValue> {
     fn apply(&self, style: &mut Style) {
         (**self).apply(style);
+    }
+    fn clone_box(&self) -> Box<dyn StylePropValue> {
+        (**self).clone_box()
+    }
+}
+
+impl Clone for Box<dyn StylePropValue> {
+    fn clone(&self) -> Self {
+        self.clone_box()
     }
 }
 
@@ -54,6 +68,7 @@ impl StylePropValue for Box<dyn StylePropValue> {
 pub type StyleProp = (Cow<'static, str>, Box<dyn StylePropValue>);
 
 /// Element node data, boxed in [`TuiNode`] to keep the enum compact.
+#[derive(Clone)]
 pub struct ElementNode {
     pub id: NodeId,
     pub tag: Cow<'static, str>,
@@ -65,21 +80,26 @@ pub struct ElementNode {
 }
 
 /// A node in the retained TUI view tree.
+#[derive(Clone)]
 pub enum TuiNode {
     Element(Box<ElementNode>),
+    /// A boundary marker. When `slot` is `Some`, this marker starts a dynamic
+    /// region whose content (between this marker and the next `slot: None`
+    /// marker) is stored in the `Rc` and updated by a reactive effect.
+    /// Layout expands slot content inline into the parent — no container node.
+    /// This follows sycamore-web's marker-delimited dynamic region pattern.
     Marker {
         id: NodeId,
+        slot: Option<Rc<RefCell<Vec<TuiNode>>>>,
     },
-    Dynamic {
+    /// A text surface leaf. The producer shapes its content into [`Cell`] rows
+    /// at the width taffy assigns (two-phase: `measure(width)` for content
+    /// height, `render(width)` for the cells). See [`crate::producer`]. The
+    /// producer is boxed behind `RefCell` so a dynamic reactive leaf can swap
+    /// in a fresh producer when its signal changes.
+    Leaf {
         id: NodeId,
-        view: Rc<RefCell<View<TuiNode>>>,
-    },
-    /// A text surface leaf. Components produce a logical `TextSurface`; taffy
-    /// supplies a rect; the surface module shapes it into visual rows for the
-    /// canvas.
-    TextSurface {
-        id: NodeId,
-        surface: Rc<RefCell<TextSurface>>,
+        producer: Rc<RefCell<Box<dyn CellProducer>>>,
         scroll: Rc<RefCell<i32>>,
     },
 }
@@ -88,9 +108,8 @@ impl TuiNode {
     pub fn id(&self) -> NodeId {
         match self {
             TuiNode::Element(element) => element.id,
-            TuiNode::Marker { id }
-            | TuiNode::Dynamic { id, .. }
-            | TuiNode::TextSurface { id, .. } => *id,
+            TuiNode::Marker { id, .. }
+            | TuiNode::Leaf { id, .. } => *id,
         }
     }
 
@@ -138,13 +157,13 @@ impl TuiNode {
                     child.collect_text(out);
                 }
             }
-            TuiNode::Dynamic { view, .. } => {
-                for node in &view.borrow().nodes {
+            TuiNode::Marker { slot: Some(content), .. } => {
+                for node in &*content.borrow() {
                     node.collect_text(out);
                 }
             }
-            TuiNode::Marker { .. } => {}
-            TuiNode::TextSurface { surface, .. } => out.push_str(&surface.borrow().plain_text()),
+            TuiNode::Marker { slot: None, .. } => {}
+            TuiNode::Leaf { producer, .. } => out.push_str(&producer.borrow().plain_text()),
         }
     }
 
@@ -195,13 +214,9 @@ impl std::fmt::Debug for TuiNode {
                 .field("id", &element.id)
                 .field("tag", &element.tag)
                 .finish_non_exhaustive(),
-            TuiNode::Marker { id } => f.debug_struct("Marker").field("id", id).finish(),
-            TuiNode::Dynamic { id, .. } => f
-                .debug_struct("Dynamic")
-                .field("id", id)
-                .finish_non_exhaustive(),
-            TuiNode::TextSurface { id, .. } => f
-                .debug_struct("TextSurface")
+            TuiNode::Marker { id, .. } => f.debug_struct("Marker").field("id", id).finish(),
+            TuiNode::Leaf { id, .. } => f
+                .debug_struct("Leaf")
                 .field("id", id)
                 .finish_non_exhaustive(),
         }
@@ -226,37 +241,46 @@ impl ViewNode for TuiNode {
         mut f: impl FnMut() -> U + 'static,
     ) -> View<Self> {
         if TypeId::of::<U>() == TypeId::of::<String>() {
-            let surface = Rc::new(RefCell::new(TextSurface::new()));
+            // A dynamic string leaf: hold a `Plain` producer behind a `RefCell`
+            // and swap its text on each signal change. The node keeps the
+            // `Rc`, so layout/paint always read the latest text.
+            let producer: Rc<RefCell<Box<dyn CellProducer>>> =
+                Rc::new(RefCell::new(Box::new(Plain::new(String::new()))));
             create_effect({
-                let surface = Rc::clone(&surface);
+                let producer = Rc::clone(&producer);
                 move || {
                     let mut value = Some(f());
                     let value: &mut Option<String> =
                         (&mut value as &mut dyn Any).downcast_mut().unwrap();
                     let s = value.take().unwrap();
-                    *surface.borrow_mut() = TextSurface::from_text(s);
+                    *producer.borrow_mut() = Box::new(Plain::new(s));
                 }
             });
-            View::from(TuiNode::TextSurface {
+            View::from(TuiNode::Leaf {
                 id: NodeId::next(),
-                surface,
+                producer,
                 scroll: Rc::new(RefCell::new(0)),
             })
         } else {
-            let view = Rc::new(RefCell::new(View::new()));
+            // Non-String path: marker-delimited dynamic region (sycamore-web).
+            // No container node — content lives inline in the parent's layout.
+            let content: Rc<RefCell<Vec<TuiNode>>> =
+                Rc::new(RefCell::new(Vec::new()));
             create_effect({
-                let view = Rc::clone(&view);
+                let content = Rc::clone(&content);
                 move || {
-                    *view.borrow_mut() = f().into();
+                    *content.borrow_mut() = f().into().nodes.into_vec();
                 }
             });
             View::from((
-                TuiNode::Marker { id: NodeId::next() },
-                TuiNode::Dynamic {
+                TuiNode::Marker {
                     id: NodeId::next(),
-                    view,
+                    slot: Some(content),
                 },
-                TuiNode::Marker { id: NodeId::next() },
+                TuiNode::Marker {
+                    id: NodeId::next(),
+                    slot: None,
+                },
             ))
         }
     }
@@ -276,20 +300,23 @@ impl ViewTuiNode for TuiNode {
     }
 
     fn create_text_node(text: Cow<'static, str>) -> Self {
-        Self::create_text_surface_node(TextSurface::from_text(text), 0)
+        Self::create_leaf_node(Box::new(Plain::new(text.into_owned())), 0)
     }
 
     fn create_marker_node() -> Self {
-        Self::Marker { id: NodeId::next() }
+        Self::Marker {
+            id: NodeId::next(),
+            slot: None,
+        }
     }
 
-    /// Construct a text-surface leaf carrying a `scroll` offset (rows hidden
-    /// above the visible window). The paint path clamps `scroll` to
-    /// `[0, total - visible_height]`, so a large value means "stick to bottom".
-    fn create_text_surface_node(surface: TextSurface, scroll: i32) -> Self {
-        Self::TextSurface {
+    /// Construct a leaf carrying a [`CellProducer`] and a `scroll` offset
+    /// (rows hidden above the visible window). The paint path clamps `scroll`
+    /// to `[0, total - visible_height]`, so a large value means "stick to bottom".
+    fn create_leaf_node(producer: Box<dyn CellProducer>, scroll: i32) -> Self {
+        Self::Leaf {
             id: NodeId::next(),
-            surface: Rc::new(RefCell::new(surface)),
+            producer: Rc::new(RefCell::new(producer)),
             scroll: Rc::new(RefCell::new(scroll)),
         }
     }
@@ -311,12 +338,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn text_surface_node_holds_surface_and_scroll() {
-        let surface = Rc::new(RefCell::new(TextSurface::from_text("hello")));
+    fn leaf_node_holds_producer_and_scroll() {
+        let producer: Rc<RefCell<Box<dyn CellProducer>>> =
+            Rc::new(RefCell::new(Box::new(Plain::new("hello"))));
         let scroll = Rc::new(RefCell::new(0i32));
-        let node = TuiNode::TextSurface {
+        let node = TuiNode::Leaf {
             id: NodeId::next(),
-            surface: surface.clone(),
+            producer: producer.clone(),
             scroll: scroll.clone(),
         };
         let mut s = String::new();
@@ -328,18 +356,18 @@ mod tests {
     }
 
     #[test]
-    fn dynamic_string_becomes_text_surface_that_updates() {
+    fn dynamic_string_becomes_leaf_that_updates() {
         use crate::reactive::create_root;
         use crate::view::View;
         let root = create_root(|| {
             let sig = crate::reactive::create_signal("a".to_string());
             let view: View = (move || sig.get_clone()).into();
             let node = &view.nodes()[0];
-            let row_count = match node {
-                TuiNode::TextSurface { surface, .. } => surface.borrow().row_count(),
-                _ => panic!("expected TextSurface, got {node:?}"),
+            let height = match node {
+                TuiNode::Leaf { producer, .. } => producer.borrow().measure(10),
+                _ => panic!("expected Leaf, got {node:?}"),
             };
-            assert_eq!(row_count, 1, "one row for \"a\"");
+            assert_eq!(height, 1, "one row for \"a\"");
         });
         root.dispose();
     }

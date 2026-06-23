@@ -1,8 +1,8 @@
-//! Taffy layout and terminal painting onto the self-built [`Canvas`].
+//! Taffy layout and terminal painting onto the self-built [`Framebuffer`].
 //!
 //! This is the crossterm-without-ratatui paint path (ADR-0024 §10–§12):
-//! taffy computes layout, a `Canvas` holds painted output, and the render
-//! driver diffs the `Canvas` between frames. The legacy ratatui `Buffer` and
+//! taffy computes layout, a `Framebuffer` holds painted output, and the render
+//! driver diffs the `Framebuffer` between frames. The legacy ratatui `Buffer` and
 //! `Rect` are gone.
 
 use std::borrow::Cow;
@@ -12,11 +12,13 @@ use taffy::prelude::{AvailableSpace, Dimension, FlexDirection, Size};
 use taffy::{NodeId as TaffyNodeId, TaffyTree};
 
 use crate::attributes::resolve_style;
-use crate::canvas::{Canvas, Rect};
+use crate::framebuffer::{Cell, Framebuffer, Rect};
 use crate::node::{NodeId, TuiNode};
-use crate::style::{Edges, Inset, Style};
-use crate::surface::TextSurface;
+use crate::producer::CellProducer;
+use crate::style::{Edges, Style};
 use crate::text::SpanStyle;
+use std::cell::RefCell;
+use std::rc::Rc;
 
 #[derive(Debug, Clone)]
 pub(crate) struct RuntimeNode {
@@ -84,7 +86,7 @@ impl RuntimeIndex {
     }
 }
 
-#[derive(Debug)]
+#[allow(dead_code)]
 struct BuiltNode {
     runtime_id: NodeId,
     taffy_id: TaffyNodeId,
@@ -93,300 +95,43 @@ struct BuiltNode {
     style: Style,
     focusable: bool,
     children: Vec<BuiltNode>,
-    surface: Option<(TextSurface, i32)>,
+    producer: Option<(Rc<RefCell<Box<dyn CellProducer>>>, i32)>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 enum Measure {
-    Surface { surface: TextSurface },
+    Producer { producer: Rc<RefCell<Box<dyn CellProducer>>> },
 }
 
-#[derive(Debug)]
 struct PaintNode {
-    rect: PaintRect,
+    rect: Rect,
     style: Style,
     children: Vec<PaintNode>,
-    surface: Option<(TextSurface, i32)>,
+    producer: Option<(Rc<RefCell<Box<dyn CellProducer>>>, i32)>,
 }
 
-impl PaintNode {
-    /// Recompute this node's `rect` to `new_rect` and re-layout the subtree
-    /// beneath it against that corrected size.
-    ///
-    /// Used for an absolutely-positioned overlay box whose `rect` had to be
-    /// re-derived from its real containing block (the screen) because taffy
-    /// sized it against a collapsed `Dynamic` wrapper (height 0). Taffy laid the
-    /// whole subtree out against that zero-height block, so percentage sizes
-    /// (`height: 100%`) collapsed to 0 and flex distribution is wrong. This
-    /// re-runs a flex pass over the subtree using `new_rect`'s content box:
-    /// each in-flow child's main-axis basis is its explicit length/percent or —
-    /// for auto-sized leaves — the measured content height at the available
-    /// width; remaining space is split by `flex_grow` (overflow shrunk by
-    /// `flex_shrink`). Absolute descendants resolve against this node's rect.
-    fn recompute_rect(&mut self, new_rect: PaintRect) {
-        self.rect = new_rect;
-        let content = content_box(self.rect, &self.style);
+// PaintNode no longer carries a custom rect-recomputation pass. Taffy computes
+// every node's layout correctly at build time; marker-delimited dynamic
+// regions are expanded inline by build_children. extract_node resolves
+// the taffy results directly.
 
-        let (abs, in_flow): (Vec<usize>, Vec<usize>) = (0..self.children.len())
-            .partition(|i| self.children[*i].style.position == taffy::style::Position::Absolute);
+// ── unified Rect (i32 coordinates) is now the single rect type ──
+// The previous Rect → Rect conversion is gone: framebuffer::Rect already
+// uses i32 for x/y, identical to the old Rect layout.
 
-        let is_row = self.style.flex_direction == FlexDirection::Row;
-        let total = if is_row { content.width } else { content.height } as f32;
-        let basis_of = |c: &PaintNode| {
-            if is_row {
-                basis_main(c, total, true, content)
-            } else {
-                basis_main(c, total, false, content)
-            }
-        };
-        let (sizes, _rem) = flex_distribute(&self.children, &in_flow, total, basis_of);
-
-        let mut cursor = if is_row { content.x } else { content.y } as f32;
-        for &i in &in_flow {
-            let main = (sizes[&i]).max(0.0).round() as u16;
-            if is_row {
-                let cross = resolve_cross(&self.children[i], false, content);
-                let r = PaintRect::new(cursor.round() as i32, content.y, main, cross);
-                self.children[i].recompute_rect(r);
-            } else {
-                let cross = resolve_cross(&self.children[i], true, content);
-                let r = PaintRect::new(content.x, cursor.round() as i32, cross, main);
-                self.children[i].recompute_rect(r);
-            }
-            cursor += main as f32;
-        }
-
-        for &i in &abs {
-            let r = absolute_rect_from_insets(&self.children[i].style, self.rect);
-            self.children[i].recompute_rect(r);
-        }
-    }
-}
-
-/// A node's content box: border box minus the drawn border edges.
-fn content_box(rect: PaintRect, style: &Style) -> PaintRect {
-    if style.border_style.is_none() {
-        return rect;
-    }
-    let edges = style.border_edges.unwrap_or(Edges::all());
-    let left = u16::from(edges.contains(Edges::LEFT));
-    let right = u16::from(edges.contains(Edges::RIGHT));
-    let top = u16::from(edges.contains(Edges::TOP));
-    let bottom = u16::from(edges.contains(Edges::BOTTOM));
-    PaintRect::new(
-        rect.x + (left as i32),
-        rect.y + (top as i32),
-        rect.width.saturating_sub(left).saturating_sub(right),
-        rect.height.saturating_sub(top).saturating_sub(bottom),
-    )
-}
-
-/// An in-flow child's main-axis basis before grow/shrink: an explicit
-/// length/percent wins; otherwise an auto-sized leaf is measured at the
-/// available cross size (column→width, row→height); otherwise 0.
-fn basis_main(child: &PaintNode, container: f32, row: bool, content: PaintRect) -> f32 {
-    let size = if row { child.style.width } else { child.style.height };
-    match size {
-        crate::style::Size::Length(v) => v as f32,
-        crate::style::Size::Percent(p) => (p / 100.0) * container,
-        _ => measure_auto(child, row, content),
-    }
-}
-
-/// Cross-axis size of an in-flow child: explicit length/percent wins; otherwise
-/// for a column the child fills the content width, for a row the content
-/// height. (`align_items: stretch` is the default we support here.)
-fn resolve_cross(child: &PaintNode, column: bool, content: PaintRect) -> u16 {
-    let size = if column { child.style.width } else { child.style.height };
-    let container = if column { content.width } else { content.height } as f32;
-    match size {
-        crate::style::Size::Length(v) => v as u16,
-        crate::style::Size::Percent(p) => ((p / 100.0) * container).round() as u16,
-        _ => {
-            // Stretch to the content cross axis, but not below the leaf's own
-            // measured minimum (a single-line text leaf is 1 tall).
-            let measured = measure_auto(child, !column, content).max(1.0) as u16;
-            if column {
-                content.width.max(measured)
-            } else {
-                content.height.max(measured)
-            }
-        }
-    }
-}
-
-/// Measured content main-size for an auto-sized node at the available cross
-/// size (column→width, row→height). A leaf with a surface is measured
-/// directly; a container recursively sums its in-flow children's measured
-/// main-sizes (plus its own padding/gap), so an auto-height prompt wrapper
-/// around a text leaf resolves to the leaf's height, not 0.
-fn measure_auto(node: &PaintNode, row: bool, content: PaintRect) -> f32 {
-    if let Some((surface, _)) = &node.surface {
-        let width = if row { content.height } else { content.width } as usize;
-        if row {
-            return surface.max_width().max(1) as f32;
-        }
-        return surface.layout(width.max(1), SpanStyle::default()).height() as f32;
-    }
-    // Container: sum in-flow children's measured main sizes + padding + gaps.
-    let inner = content_box(content, &node.style);
-    let cross_size = if row { inner.height } else { inner.width } as usize;
-    let gap = match node.style.gap {
-        crate::style::Gap::Unset => {
-            if row { node.style.row_gap } else { node.style.column_gap }
-        }
-        other => other,
-    };
-    let gap_px = match gap {
-        crate::style::Gap::Length(v) => v as f32,
-        crate::style::Gap::Percent(p) => (p / 100.0) * cross_size as f32,
-        _ => 0.0,
-    };
-    let is_row = node.style.flex_direction == FlexDirection::Row;
-    let mut total = 0.0f32;
-    let mut count = 0u32;
-    for child in &node.children {
-        if child.style.position == taffy::style::Position::Absolute {
-            continue;
-        }
-        let basis = if is_row == row {
-            // Same axis: measure the child's main size at the cross content size.
-            basis_main(child, cross_size as f32, row, inner)
-        } else {
-            // Cross axis: the child's measured cross size contributes to THIS
-            // node's main size only via its own main layout; approximate with
-            // the child's auto measure on this node's main axis.
-            measure_auto(child, row, inner)
-        };
-        total += basis;
-        count += 1;
-    }
-    if count > 1 {
-        total += gap_px * (count - 1) as f32;
-    }
-    total
-}
-
-/// Resolve an in-flow set of children's main-axis sizes by flexbox: each gets
-/// its basis, then leftover space is grown (or overflow shrunk).
-fn flex_distribute(
-    children: &[PaintNode],
-    in_flow: &[usize],
-    total: f32,
-    basis_of: impl Fn(&PaintNode) -> f32,
-) -> (std::collections::HashMap<usize, f32>, f32) {
-    let mut sizes: std::collections::HashMap<usize, f32> = std::collections::HashMap::new();
-    let mut remaining = total;
-    let mut total_grow = 0.0f32;
-    for &i in in_flow {
-        let basis = basis_of(&children[i]).min(remaining.max(0.0));
-        sizes.insert(i, basis);
-        remaining -= basis;
-        total_grow += children[i].style.flex_grow;
-    }
-    if total_grow > 0.0 && remaining > 0.0 {
-        for &i in in_flow {
-            let frac = children[i].style.flex_grow / total_grow;
-            *sizes.get_mut(&i).unwrap() += frac * remaining;
-        }
-        remaining = 0.0;
-    } else if remaining < 0.0 {
-        let total_shrink: f32 = in_flow
-            .iter()
-            .map(|&i| children[i].style.flex_shrink.unwrap_or(1.0))
-            .sum();
-        if total_shrink > 0.0 {
-            for &i in in_flow {
-                let s = children[i].style.flex_shrink.unwrap_or(1.0) / total_shrink;
-                *sizes.get_mut(&i).unwrap() += s * remaining;
-            }
-        }
-        remaining = 0.0;
-    }
-    (sizes, remaining)
-}
-
-/// A rectangle in terminal-cell space, used inside the paint pipeline. Unlike
-/// the public [`Rect`] (whose coordinates are `u16`), positions here are
-/// `i32` so a node may sit at a negative coordinate — this is what makes
-/// scrolling work: an in-flow child of an `overflow: hidden` viewport is
-/// translated up by a negative `margin_top`, landing above the viewport's
-/// origin, and the paint pipeline clips the off-screen portion. Width/height
-/// stay `u16` (sizes are never negative).
-///
-/// The previous implementation clamped positions to `>= 0` in `rect_from_layout`
-/// (because `Rect` is `u16`), which silently pinned any scrolled content to the
-/// top of its viewport — `margin_top = -10` painted as if it were `0`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct PaintRect {
-    x: i32,
-    y: i32,
-    width: u16,
-    height: u16,
-}
-
-impl PaintRect {
-    const ZERO: PaintRect = PaintRect {
-        x: 0,
-        y: 0,
-        width: 0,
-        height: 0,
-    };
-
-    fn new(x: i32, y: i32, width: u16, height: u16) -> Self {
-        Self {
-            x,
-            y,
-            width,
-            height,
-        }
-    }
-
-    /// Exclusive right edge, saturating at `i32::MAX`.
-    fn right(self) -> i32 {
-        self.x.saturating_add(self.width as i32)
-    }
-
-    /// Exclusive bottom edge, saturating at `i32::MAX`.
-    fn bottom(self) -> i32 {
-        self.y.saturating_add(self.height as i32)
-    }
-
-    /// Convert to the public [`Rect`], clamping positions into the `u16`
-    /// range. Used only when handing a paint rect to canvas cell-writing
-    /// methods (which take `u16` coords) — by then the paint pipeline has
-    /// already clipped, so any still-negative position is genuinely off-screen
-    /// and the clamp is a no-op for visible cells.
-    fn to_canvas_rect(self) -> Rect {
-        Rect::new(
-            self.x.clamp(0, u16::MAX as i32) as u16,
-            self.y.clamp(0, u16::MAX as i32) as u16,
-            self.width,
-            self.height,
-        )
-    }
-}
-
-impl From<Rect> for PaintRect {
-    fn from(rect: Rect) -> Self {
-        PaintRect::new(rect.x as i32, rect.y as i32, rect.width, rect.height)
-    }
-}
-
-/// Lay out `nodes` into `area` and paint the result into a fresh [`Canvas`].
+/// Lay out `nodes` into `area` and paint the result into a fresh [`Framebuffer`].
 /// Also returns a [`RuntimeIndex`] for hit testing, focus, and event bubbling.
 pub(crate) fn render(
     nodes: &[TuiNode],
     area: Rect,
     _focused: Option<NodeId>,
-) -> (Canvas, RuntimeIndex) {
+) -> (Framebuffer, RuntimeIndex) {
     let mut taffy = TaffyTree::<Measure>::new();
-    let mut built_roots = Vec::new();
-    for node in nodes {
-        if let Some(built) = build_node(&mut taffy, node, None) {
-            built_roots.push(built);
-        }
-    }
+    // Top-level nodes are built exactly like an element's children (markers
+    // delimiting dynamic regions are expanded inline), so a bare
+    // `view! { Show(..) { .. } }` at the root renders rather than being
+    // dropped as a no-op marker pair.
+    let built_roots = build_children(&mut taffy, nodes, None);
 
     let root_children = built_roots
         .iter()
@@ -411,26 +156,25 @@ pub(crate) fn render(
         },
         |known, available, _node, context, _style| {
             context.map_or(Size::ZERO, |ctx| match ctx {
-                Measure::Surface { surface } => measure_surface(surface, known, available),
+                Measure::Producer { producer } => measure_producer(&**producer.borrow(), known, available),
             })
         },
     );
 
     let mut index = RuntimeIndex::default();
-    let area_paint: PaintRect = area.into();
     let paint_nodes = built_roots
         .iter()
-        .map(|built| extract_node(&taffy, built, area_paint, &mut index))
+        .map(|built| extract_node(&taffy, built, area, &mut index))
         .collect::<Vec<_>>();
 
-    let mut canvas = Canvas::empty(area);
+    let mut fb = Framebuffer::empty(area);
     // Text paint inherits from the root; layout/border/background do not.
     let root_text = SpanStyle::default();
     for node in &paint_nodes {
-        paint_node(&mut canvas, node, root_text, area_paint, area_paint);
+        paint_node(&mut fb, node, root_text, area, area);
     }
 
-    (canvas, index)
+    (fb, index)
 }
 
 fn build_node(
@@ -440,21 +184,20 @@ fn build_node(
 ) -> Option<BuiltNode> {
     match node {
         TuiNode::Marker { .. } => None,
-        TuiNode::TextSurface {
+        TuiNode::Leaf {
             id,
-            surface,
+            producer,
             scroll,
         } => {
-            let surface_snapshot = surface.borrow().clone();
             let scroll_value = *scroll.borrow();
             let taffy_id = tree
                 .new_leaf_with_context(
                     taffy::style::Style::default(),
-                    Measure::Surface {
-                        surface: surface_snapshot.clone(),
+                    Measure::Producer {
+                        producer: Rc::clone(producer),
                     },
                 )
-                .expect("create text surface leaf");
+                .expect("create leaf");
             Some(BuiltNode {
                 runtime_id: *id,
                 taffy_id,
@@ -463,32 +206,7 @@ fn build_node(
                 style: Style::default(),
                 focusable: false,
                 children: Vec::new(),
-                surface: Some((surface_snapshot, scroll_value)),
-            })
-        }
-        TuiNode::Dynamic { id, view } => {
-            let children = view
-                .borrow()
-                .nodes
-                .iter()
-                .filter_map(|child| build_node(tree, child, Some(*id)))
-                .collect::<Vec<_>>();
-            let child_ids = children
-                .iter()
-                .map(|child| child.taffy_id)
-                .collect::<Vec<_>>();
-            let taffy_id = tree
-                .new_with_children(default_container_style(), &child_ids)
-                .expect("create dynamic container");
-            Some(BuiltNode {
-                runtime_id: *id,
-                taffy_id,
-                parent,
-                tag: None,
-                style: Style::default(),
-                focusable: false,
-                children,
-                surface: None,
+                producer: Some((Rc::clone(producer), scroll_value)),
             })
         }
         TuiNode::Element(element) => {
@@ -499,12 +217,13 @@ fn build_node(
             if leaf {
                 let text = element_text(node);
                 let display_text = display_text_for_tag(Some(&tag_name), &text).into_owned();
-                let surface = TextSurface::from_text(display_text);
+                let producer: Rc<RefCell<Box<dyn CellProducer>>> =
+                    Rc::new(RefCell::new(Box::new(crate::producer::Plain::new(display_text))));
                 let taffy_id = tree
                     .new_leaf_with_context(
                         style.to_taffy(),
-                        Measure::Surface {
-                            surface: surface.clone(),
+                        Measure::Producer {
+                            producer: Rc::clone(&producer),
                         },
                     )
                     .expect("create element leaf");
@@ -516,14 +235,10 @@ fn build_node(
                     style,
                     focusable,
                     children: Vec::new(),
-                    surface: Some((surface, 0)),
+                    producer: Some((producer, 0)),
                 })
             } else {
-                let built_children = element
-                    .children
-                    .iter()
-                    .filter_map(|child| build_node(tree, child, Some(element.id)))
-                    .collect::<Vec<_>>();
+                let built_children = build_children(tree, &element.children, Some(element.id));
                 let child_ids = built_children
                     .iter()
                     .map(|child| child.taffy_id)
@@ -539,29 +254,67 @@ fn build_node(
                     style,
                     focusable,
                     children: built_children,
-                    surface: None,
+                    producer: None,
                 })
             }
         }
     }
 }
 
+/// Build taffy children for a parent element's child list, expanding
+/// marker-delimited dynamic regions inline (sycamore-web pattern). `parent` is
+/// `None` for the top-level root list, `Some(element_id)` inside an element.
+fn build_children(
+    tree: &mut TaffyTree<Measure>,
+    children: &[TuiNode],
+    parent: Option<NodeId>,
+) -> Vec<BuiltNode> {
+    let mut built = Vec::new();
+    let mut i = 0;
+    while i < children.len() {
+        match &children[i] {
+            TuiNode::Marker {
+                slot: Some(content), ..
+            } => {
+                // Dynamic region: expand content nodes inline into the parent.
+                for node in &*content.borrow() {
+                    if let Some(b) = build_node(tree, node, parent) {
+                        built.push(b);
+                    }
+                }
+                // Skip to the end marker.
+                i += 1;
+                while i < children.len() {
+                    if matches!(&children[i], TuiNode::Marker { slot: None, .. }) {
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            child => {
+                if let Some(b) = build_node(tree, child, parent) {
+                    built.push(b);
+                }
+            }
+        }
+        i += 1;
+    }
+    built
+}
+
 fn extract_node(
     tree: &TaffyTree<Measure>,
     built: &BuiltNode,
-    parent_rect: PaintRect,
+    parent_rect: Rect,
     index: &mut RuntimeIndex,
 ) -> PaintNode {
     let layout = tree.layout(built.taffy_id).expect("taffy layout");
     let rect = rect_from_layout(layout, parent_rect);
-    // The runtime index (hit testing, focus) only cares about on-screen
-    // elements, so it stores the public u16 Rect clamped to the screen — a
-    // node scrolled above the viewport is not clickable.
     index.nodes.insert(
         built.runtime_id,
         RuntimeNode {
             parent: built.parent,
-            rect: rect.to_canvas_rect(),
+            rect,
             tag: built.tag.clone(),
         },
     );
@@ -573,39 +326,7 @@ fn extract_node(
         .children
         .iter()
         .map(|child| {
-            let (child_parent, child_rect_override) = if built.tag.is_none()
-                && child.style.position == taffy::style::Position::Absolute
-            {
-                // A `Dynamic` wrapper (no tag) collapses to zero height when it
-                // is a flex item after a non-growing sibling, and taffy makes
-                // the Dynamic the containing block for its absolute child — so
-                // taffy sizes the child to 0. Reparent the child to the screen
-                // (its true containing block) and re-derive its rect from the
-                // containing block minus the child's own insets, instead of the
-                // (collapsed) size taffy computed.
-                let containing = parent_rect;
-                let r = absolute_rect_from_insets(&child.style, containing);
-                (containing, Some(r))
-            } else {
-                (rect, None)
-            };
-            let mut paint = extract_node(tree, child, child_parent, index);
-            if let Some(r) = child_rect_override {
-                paint.rect = r;
-                // Keep the runtime index in sync so hit testing/focus use the
-                // corrected on-screen rect, not the collapsed taffy size.
-                index.nodes.insert(child.runtime_id, RuntimeNode {
-                    parent: child.parent,
-                    rect: r.to_canvas_rect(),
-                    tag: child.tag.clone(),
-                });
-                // The child's subtree was laid out by taffy against a
-                // zero-height containing block, so every descendant's size is
-                // wrong. Re-layout the subtree against the corrected rect so a
-                // `height: 100%` content root fills the overlay and its flex
-                // children anchor to the bottom instead of collapsing to 0.
-                paint.recompute_rect(r);
-            }
+            let paint = extract_node(tree, child, rect, index);
             paint
         })
         .collect();
@@ -613,47 +334,40 @@ fn extract_node(
         rect,
         style: built.style.clone(),
         children,
-        surface: built.surface.clone(),
+        producer: built.producer.clone(),
     }
 }
 
-/// Resolve an absolutely-positioned node's rect from a containing block and the
-/// node's own insets (`top`/`right`/`bottom`/`left`, falling back to `inset`).
-/// Used when the real containing block (the screen) differs from the one taffy
-/// resolved (a collapsed wrapper), so the size can't be trusted from layout.
-///
-/// Horizontal insets (`left`/`right`) resolve percentages against the
-/// containing block's width; vertical ones (`top`/`bottom`) against its height
-/// — matching CSS and `LengthPercentage::resolve` in taffy.
-fn absolute_rect_from_insets(style: &Style, containing: PaintRect) -> PaintRect {
-    // Mirrors `Inset::or` (private in style.rs): `Unset` falls back to the
-    // aggregate `inset`, otherwise the per-side value wins. `Auto` on an
-    // absolutely-positioned edge means "not pinned on this side" (no offset),
-    // so it resolves to 0 here.
-    let pct_of = |p: f32, axis: u16| -> i32 { ((p / 100.0) * axis as f32).round() as i32 };
-    let resolve = |side: Inset, fallback: Inset, axis: u16| -> i32 {
-        let resolved = match side {
-            Inset::Unset => fallback,
-            other => other,
-        };
-        match resolved {
-            Inset::Length(v) => v as i32,
-            Inset::Percent(p) => pct_of(p, axis),
-            Inset::Unset | Inset::Auto => 0,
+/// Write one shaped [`Cell`] row into the framebuffer at screen row `y`,
+/// starting at column `x`, clipping to `clip_rect`. The producer has already
+/// shaped the row to `width` cells; this only copies the in-bounds cells into
+/// the framebuffer row. The inherited `text` style was applied when the
+/// producer built the cells, so no patching happens here.
+fn write_row_into(
+    fb: &mut Framebuffer,
+    y: i32,
+    x: i32,
+    clip_rect: &Rect,
+    row: &[Cell],
+) {
+    if y < 0 || y as usize >= fb.height() {
+        return;
+    }
+    let dst = fb.row_mut(y);
+    for (col, cell) in row.iter().enumerate() {
+        let abs_x = x + col as i32;
+        if abs_x < clip_rect.x || abs_x >= clip_rect.right() {
+            continue;
         }
-    };
-    let top = resolve(style.top, style.inset, containing.height);
-    let bottom = resolve(style.bottom, style.inset, containing.height);
-    let left = resolve(style.left, style.inset, containing.width);
-    let right = resolve(style.right, style.inset, containing.width);
-    let x = containing.x + left;
-    let y = containing.y + top;
-    let width = containing.width.saturating_sub((left + right).max(0) as u16);
-    let height = containing.height.saturating_sub((top + bottom).max(0) as u16);
-    PaintRect::new(x, y, width, height)
+        let ux = abs_x as usize;
+        if ux >= dst.len() {
+            continue;
+        }
+        dst[ux] = cell.clone();
+    }
 }
 
-/// Paint a node into the canvas: background, border, then text, recursing with
+/// Paint a node into the framebuffer: background, border, then text, recursing with
 /// the inherited text style (ADR-0024 §6). Layout properties, `border_*`, and
 /// container `background_color` do not inherit.
 ///
@@ -667,11 +381,11 @@ fn absolute_rect_from_insets(style: &Style, containing: PaintRect) -> PaintRect 
 /// collapsed because its only child is out-of-flow) still recurses into its
 /// children; it just draws nothing of its own.
 fn paint_node(
-    canvas: &mut Canvas,
+    fb: &mut Framebuffer,
     node: &PaintNode,
     parent_text: SpanStyle,
-    clip: PaintRect,
-    screen: PaintRect,
+    clip: Rect,
+    screen: Rect,
 ) {
     let has_size = node.rect.width != 0 && node.rect.height != 0;
 
@@ -680,7 +394,7 @@ fn paint_node(
     let text = parent_text.patch(node.style.text_span_style());
     if has_size {
         if let Some(bg) = node.style.background_color
-            && let Some(rect) = intersect_rect(node.rect, clip)
+            && let Some(intersected) = node.rect.intersect(clip)
         {
             // A background is opaque: it must cover whatever was painted into
             // these cells earlier (e.g. text beneath an absolutely-positioned
@@ -688,9 +402,8 @@ fn paint_node(
             // Mirrors iocraft's `View::draw`, which `clear_text`s before
             // `set_background_color`. This node's own border/text are drawn
             // afterwards and so still show on top.
-            let canvas_rect = rect.to_canvas_rect();
-            canvas.clear_text(canvas_rect);
-            canvas.set_background_color(canvas_rect, bg);
+            fb.clear_text(intersected);
+            fb.set_background_color(intersected, bg);
         }
 
         if let Some(border_chars) = node.style.border_style.border_characters() {
@@ -700,7 +413,7 @@ fn paint_node(
                 ..SpanStyle::default()
             };
             paint_border_clipped(
-                canvas,
+                fb,
                 node.rect,
                 border_chars,
                 node.style.border_edges,
@@ -709,22 +422,30 @@ fn paint_node(
             );
         }
 
-        if let Some((surface, scroll)) = &node.surface {
+        if let Some((producer, scroll)) = &node.producer {
             let width = node.rect.width as usize;
-            let layout = surface.layout(width, text);
-            let clip_rect = intersect_rect(node.rect, clip).unwrap_or(PaintRect::ZERO);
-            // Wipe any stale characters from the previous frame inside this
-            // node's visible rect BEFORE painting the new rows. Without this, a
-            // text surface that does not cover every cell of its rect (e.g. a
-            // manually-scrolled transcript pre-sliced to `viewport_rows`) would
-            // leave old characters in the canvas; the diff path then either
-            // short-circuits on equal cells or keeps the previous frame's
-            // inline-code background visible, producing the "bg shifts on
-            // scroll" artefact. `clear_text` resets the canvas cells to their
-            // default character (None), so the diff emits a space and a bg
-            // reset for those cells.
+            let mut rows = producer.borrow().render(width);
+            // Patch each cell's glyph style with the inherited text style so
+            // ancestor properties (dim, crossed_out, underline_color, fg, bg)
+            // propagate through the tree, matching the legacy TextSurface
+            // layout behaviour.
+            for row in &mut rows {
+                for cell in row.iter_mut() {
+                    if let Some(glyph) = &mut cell.glyph {
+                        glyph.style = text.patch(glyph.style);
+                    }
+                }
+            }
+            let clip_rect = node.rect.intersect(clip).unwrap_or_default();
+            // Wipe any stale glyphs from the previous frame inside this node's
+            // visible rect BEFORE painting the new rows. Without this, a leaf
+            // that does not cover every cell of its rect would leave old glyphs
+            // in the framebuffer; the diff path then either short-circuits on
+            // equal cells or keeps the previous frame's inline-code background
+            // visible, producing the "bg shifts on scroll" artefact. `clear_text`
+            // resets the cells to their default glyph (None).
             if clip_rect.width > 0 && clip_rect.height > 0 {
-                canvas.clear_text(clip_rect.to_canvas_rect());
+                fb.clear_text(clip_rect);
             }
             // The on-screen window for this node is its clipped rect. The node's
             // own `rect.height` is its *natural* content height (taffy does not
@@ -733,15 +454,13 @@ fn paint_node(
             // `[0, total - visible_height]` so a large value means "stick to
             // bottom": the caller passes a sentinel (e.g. `i32::MAX`) and the
             // last `visible_height` rows land inside the clip without the caller
-            // having to know the viewport height. A scroll of 0 (and any in-range
-            // value) behaves exactly as before — `i < scroll` skips head rows and
-            // the clip_rect clips the tail.
+            // having to know the viewport height.
             let visible_height = clip_rect.height as usize;
-            let total = layout.rows().len();
+            let total = rows.len();
             let max_scroll = total.saturating_sub(visible_height);
             let scroll = (*scroll).max(0) as usize;
             let scroll = scroll.min(max_scroll);
-            for (i, row) in layout.rows().iter().enumerate() {
+            for (i, row) in rows.iter().enumerate() {
                 if i < scroll {
                     continue;
                 }
@@ -749,12 +468,7 @@ fn paint_node(
                 if y < clip_rect.y || y >= clip_rect.bottom() {
                     continue;
                 }
-                let segs: Vec<(&str, SpanStyle)> = row
-                    .segments
-                    .iter()
-                    .map(|segment| (segment.content.as_str(), segment.style))
-                    .collect();
-                canvas.set_segments(clip_rect.to_canvas_rect(), y as u16, &segs);
+                write_row_into(fb, y, node.rect.x, &clip_rect, row);
             }
         }
     }
@@ -762,9 +476,12 @@ fn paint_node(
     let child_clip = if node.style.overflow == taffy::style::Overflow::Visible {
         clip
     } else {
-        intersect_rect(clip, content_rect(node)).unwrap_or(PaintRect::ZERO)
+        clip.intersect(content_rect(node)).unwrap_or_default()
     };
-    for child in &node.children {
+    // Sort children by z-index so higher values paint on top (painter's algorithm).
+    let mut sorted: Vec<&PaintNode> = node.children.iter().collect();
+    sorted.sort_by_key(|child| child.style.z_index);
+    for child in sorted {
         // An absolutely-positioned child lives in its containing block, not this
         // node's flex flow, so clip it to the screen rather than the parent.
         let bounds = if child.style.position == taffy::style::Position::Absolute {
@@ -772,17 +489,17 @@ fn paint_node(
         } else {
             child_clip
         };
-        paint_node(canvas, child, text, bounds, screen);
+        paint_node(fb, child, text, bounds, screen);
     }
 }
 
 fn paint_border_clipped(
-    canvas: &mut Canvas,
-    rect: PaintRect,
+    fb: &mut Framebuffer,
+    rect: Rect,
     chars: crate::style::BorderCharacters,
     edges: Option<Edges>,
     style: SpanStyle,
-    clip: PaintRect,
+    clip: Rect,
 ) {
     let edges = edges.unwrap_or(Edges::all());
     if rect.width < 2 || rect.height < 2 {
@@ -796,8 +513,8 @@ fn paint_border_clipped(
         let right_border_size = u16::from(edges.contains(Edges::RIGHT));
         if edges.contains(Edges::LEFT) {
             paint_text_clipped_raw(
-                canvas,
-                PaintRect::new(rect.x, rect.y, 1, 1),
+                fb,
+                Rect::new(rect.x, rect.y, 1, 1),
                 &chars.top_left.to_string(),
                 style,
                 clip,
@@ -808,16 +525,16 @@ fn paint_border_clipped(
             .saturating_sub(left_border_size)
             .saturating_sub(right_border_size);
         paint_text_clipped_raw(
-            canvas,
-            PaintRect::new(rect.x + (left_border_size as i32), rect.y, width, 1),
+            fb,
+            Rect::new(rect.x + (left_border_size as i32), rect.y, width, 1),
             &chars.top.to_string().repeat(width as usize),
             style,
             clip,
         );
         if edges.contains(Edges::RIGHT) {
             paint_text_clipped_raw(
-                canvas,
-                PaintRect::new(right, rect.y, 1, 1),
+                fb,
+                Rect::new(right, rect.y, 1, 1),
                 &chars.top_right.to_string(),
                 style,
                 clip,
@@ -827,8 +544,8 @@ fn paint_border_clipped(
     for y in rect.y + 1..bottom {
         if edges.contains(Edges::LEFT) {
             paint_text_clipped_raw(
-                canvas,
-                PaintRect::new(rect.x, y, 1, 1),
+                fb,
+                Rect::new(rect.x, y, 1, 1),
                 &chars.left.to_string(),
                 style,
                 clip,
@@ -836,8 +553,8 @@ fn paint_border_clipped(
         }
         if edges.contains(Edges::RIGHT) {
             paint_text_clipped_raw(
-                canvas,
-                PaintRect::new(right, y, 1, 1),
+                fb,
+                Rect::new(right, y, 1, 1),
                 &chars.right.to_string(),
                 style,
                 clip,
@@ -849,8 +566,8 @@ fn paint_border_clipped(
         let right_border_size = u16::from(edges.contains(Edges::RIGHT));
         if edges.contains(Edges::LEFT) {
             paint_text_clipped_raw(
-                canvas,
-                PaintRect::new(rect.x, bottom, 1, 1),
+                fb,
+                Rect::new(rect.x, bottom, 1, 1),
                 &chars.bottom_left.to_string(),
                 style,
                 clip,
@@ -861,16 +578,16 @@ fn paint_border_clipped(
             .saturating_sub(left_border_size)
             .saturating_sub(right_border_size);
         paint_text_clipped_raw(
-            canvas,
-            PaintRect::new(rect.x + (left_border_size as i32), bottom, width, 1),
+            fb,
+            Rect::new(rect.x + (left_border_size as i32), bottom, width, 1),
             &chars.bottom.to_string().repeat(width as usize),
             style,
             clip,
         );
         if edges.contains(Edges::RIGHT) {
             paint_text_clipped_raw(
-                canvas,
-                PaintRect::new(right, bottom, 1, 1),
+                fb,
+                Rect::new(right, bottom, 1, 1),
                 &chars.bottom_right.to_string(),
                 style,
                 clip,
@@ -880,11 +597,11 @@ fn paint_border_clipped(
 }
 
 fn paint_text_clipped_raw(
-    canvas: &mut Canvas,
-    rect: PaintRect,
+    fb: &mut Framebuffer,
+    rect: Rect,
     text: &str,
     style: SpanStyle,
-    clip: PaintRect,
+    clip: Rect,
 ) {
     if text.is_empty() || rect.width == 0 || rect.height == 0 {
         return;
@@ -912,11 +629,9 @@ fn paint_text_clipped_raw(
             }
         }
         let x = rect.x + (col as i32);
-        if contains_point_i32(clip, x, y) {
-            // `contains_point_i32` against a screen-space clip guarantees x,y >= 0,
-            // but clamp defensively so a stray negative can never wrap into a huge u16.
-            canvas.set_text(
-                Rect::new(x.max(0) as u16, y.max(0) as u16, cw as u16, 1),
+        if clip.contains(x, y) {
+            fb.set_text(
+                Rect::new(x, y, cw as u16, 1),
                 &ch.to_string(),
                 style,
             );
@@ -925,7 +640,7 @@ fn paint_text_clipped_raw(
     }
 }
 
-fn content_rect(node: &PaintNode) -> PaintRect {
+fn content_rect(node: &PaintNode) -> Rect {
     if node.style.border_style.is_none() {
         return node.rect;
     }
@@ -934,7 +649,7 @@ fn content_rect(node: &PaintNode) -> PaintRect {
     let right = u16::from(edges.contains(Edges::RIGHT));
     let top = u16::from(edges.contains(Edges::TOP));
     let bottom = u16::from(edges.contains(Edges::BOTTOM));
-    PaintRect::new(
+    Rect::new(
         node.rect.x + (left as i32),
         node.rect.y + (top as i32),
         node.rect.width.saturating_sub(left).saturating_sub(right),
@@ -942,27 +657,12 @@ fn content_rect(node: &PaintNode) -> PaintRect {
     )
 }
 
-fn intersect_rect(a: PaintRect, b: PaintRect) -> Option<PaintRect> {
-    let x = a.x.max(b.x);
-    let y = a.y.max(b.y);
-    let right = a.right().min(b.right());
-    let bottom = a.bottom().min(b.bottom());
-    (x < right && y < bottom).then(|| {
-        PaintRect::new(
-            x,
-            y,
-            (right - x).clamp(0, u16::MAX as i32) as u16,
-            (bottom - y).clamp(0, u16::MAX as i32) as u16,
-        )
-    })
-}
-
-fn measure_surface(
-    surface: &TextSurface,
+fn measure_producer(
+    producer: &dyn CellProducer,
     known: Size<Option<f32>>,
     available: Size<AvailableSpace>,
 ) -> Size<f32> {
-    let raw_width = surface.max_width() as f32;
+    let raw_width = producer.intrinsic_width() as f32;
     let available_width = match available.width {
         AvailableSpace::Definite(w) => w.max(1.0),
         AvailableSpace::MinContent | AvailableSpace::MaxContent => raw_width.max(1.0),
@@ -970,30 +670,22 @@ fn measure_surface(
     let width = known
         .width
         .unwrap_or(raw_width.min(available_width).max(1.0));
-    let height = known.height.unwrap_or_else(|| {
-        surface
-            .layout(width as usize, SpanStyle::default())
-            .height() as f32
-    });
+    let height =
+        known
+            .height
+            .unwrap_or_else(|| producer.measure(width.max(1.0) as usize) as f32);
     Size { width, height }
 }
 
-fn rect_from_layout(layout: &taffy::Layout, parent_rect: PaintRect) -> PaintRect {
+fn rect_from_layout(layout: &taffy::Layout, parent_rect: Rect) -> Rect {
     let x = parent_rect.x as f32 + layout.location.x;
     let y = parent_rect.y as f32 + layout.location.y;
-    PaintRect::new(
+    Rect::new(
         x.round() as i32,
         y.round() as i32,
         layout.size.width.round().max(0.0) as u16,
         layout.size.height.round().max(0.0) as u16,
     )
-}
-
-fn default_container_style() -> taffy::style::Style {
-    taffy::style::Style {
-        flex_direction: FlexDirection::Column,
-        ..taffy::style::Style::default()
-    }
 }
 
 fn default_style_for_tag(tag: &str) -> Style {
@@ -1008,11 +700,19 @@ fn default_style_for_tag(tag: &str) -> Style {
 }
 
 fn is_text_leaf(tag: &str, children: &[TuiNode]) -> bool {
+    // An element with marker-delimited dynamic content must be a container,
+    // not a leaf — the slot nodes are expanded inline during build.
+    if children
+        .iter()
+        .any(|c| matches!(c, TuiNode::Marker { slot: Some(..), .. }))
+    {
+        return false;
+    }
     matches!(tag, "span" | "p" | "input")
         || (tag == "button"
             && children
                 .iter()
-                .all(|child| matches!(child, TuiNode::TextSurface { .. } | TuiNode::Marker { .. })))
+                .all(|child| matches!(child, TuiNode::Leaf { .. } | TuiNode::Marker { .. })))
 }
 
 fn element_text(node: &TuiNode) -> String {
@@ -1043,14 +743,8 @@ fn is_focusable(node: &TuiNode) -> bool {
 }
 
 fn contains_point(rect: Rect, x: u16, y: u16) -> bool {
-    x >= rect.x && x < rect.right() && y >= rect.y && y < rect.bottom()
-}
-
-/// Paint-pipeline variant of [`contains_point`]: the clip rect and the candidate
-/// coordinates may be negative (a node scrolled above the viewport's origin), so
-/// the test runs in `i32`. A point with `x < 0` or `y < 0` is off the left/top
-/// edge of the terminal and never visible.
-fn contains_point_i32(rect: PaintRect, x: i32, y: i32) -> bool {
+    let x = x as i32;
+    let y = y as i32;
     x >= rect.x && x < rect.right() && y >= rect.y && y < rect.bottom()
 }
 
@@ -1117,8 +811,8 @@ mod tests {
             nodes = view.nodes.into_iter().collect();
         });
 
-        let (canvas, _index) = render(&nodes, Rect::new(0, 0, 12, 5), None);
-        let painted = canvas_to_plain_text(&canvas);
+        let (fb, _index) = render(&nodes, Rect::new(0, 0, 12, 5), None);
+        let painted = canvas_to_plain_text(&fb);
 
         assert!(
             painted.contains('▁'),
@@ -1137,9 +831,9 @@ mod tests {
 
     #[test]
     fn top_only_border_spans_full_width() {
-        let mut canvas = Canvas::empty(Rect::new(0, 0, 6, 2));
+        let mut fb = Framebuffer::empty(Rect::new(0, 0, 6, 2));
         paint_border_clipped(
-            &mut canvas,
+            &mut fb,
             Rect::new(0, 0, 6, 2).into(),
             BorderCharacters {
                 top: '▁',
@@ -1150,7 +844,7 @@ mod tests {
             Rect::new(0, 0, 6, 2).into(),
         );
 
-        let painted = canvas_to_plain_text(&canvas);
+        let painted = canvas_to_plain_text(&fb);
         assert!(
             painted.starts_with("▁▁▁▁▁▁"),
             "top-only border should fill both ends: {painted}"
@@ -1172,8 +866,8 @@ mod tests {
             nodes = view.nodes.into_iter().collect();
         });
 
-        let (canvas, _index) = render(&nodes, Rect::new(0, 0, 20, 8), None);
-        let painted = canvas_to_plain_text(&canvas);
+        let (fb, _index) = render(&nodes, Rect::new(0, 0, 20, 8), None);
+        let painted = canvas_to_plain_text(&fb);
 
         assert!(
             painted.contains("line 0"),
@@ -1192,7 +886,7 @@ mod tests {
 
     /// Regression for in-flow scrolling: an `overflow: hidden` viewport with an
     /// in-flow child translated up by a negative `margin_top` must show the
-    /// child's TAIL (it scrolled up) and clip its head. Before the `PaintRect`
+    /// child's TAIL (it scrolled up) and clip its head. Before the `Rect`
     /// change, `rect_from_layout` clamped the child's negative y to 0, so the
     /// content stayed pinned to the top and never scrolled — the markdown
     /// example's follow-the-tail appeared frozen at the first line.
@@ -1218,8 +912,8 @@ mod tests {
             nodes = view.nodes.into_iter().collect();
         });
 
-        let (canvas, _index) = render(&nodes, Rect::new(0, 0, 20, 8), None);
-        let painted = canvas_to_plain_text(&canvas);
+        let (fb, _index) = render(&nodes, Rect::new(0, 0, 20, 8), None);
+        let painted = canvas_to_plain_text(&fb);
 
         // The tail scrolled into view.
         assert!(
@@ -1249,27 +943,24 @@ mod tests {
     /// and the paint path resolves the real window from taffy's height.
     #[test]
     fn text_surface_with_large_scroll_sticks_to_bottom() {
-        use crate::surface::TextSurface;
+        use crate::producer::Plain;
         use crate::view::ViewTuiNode;
         let mut nodes = Vec::new();
         let root = create_root(|| {
-            // A 4-tall viewport whose child surface holds 5 lines and a sentinel
+            // A 4-tall viewport whose child leaf holds 5 lines and a sentinel
             // scroll (i32::MAX). Only lines 1..4 should paint; line 0 is above
             // the clamped window.
-            let surface = TextSurface::from_text("line 0\nline 1\nline 2\nline 3\nline 4");
+            let producer: Box<dyn CellProducer> = Box::new(Plain::new("line 0\nline 1\nline 2\nline 3\nline 4"));
             let view: View = tags::div()
                 .width(10)
                 .height(4)
                 .overflow(taffy::style::Overflow::Hidden)
-                .children(View::from_node(TuiNode::create_text_surface_node(
-                    surface,
-                    i32::MAX,
-                )))
+                .children(View::from_node(TuiNode::create_leaf_node(producer, i32::MAX)))
                 .into();
             nodes = view.nodes.into_iter().collect();
         });
-        let (canvas, _index) = render(&nodes, Rect::new(0, 0, 12, 6), None);
-        let painted = canvas_to_plain_text(&canvas);
+        let (fb, _index) = render(&nodes, Rect::new(0, 0, 12, 6), None);
+        let painted = canvas_to_plain_text(&fb);
         assert!(
             painted.contains("line 4"),
             "stick-to-bottom must show the last line: {painted}"
@@ -1290,23 +981,21 @@ mod tests {
     /// guards the backward-compatibility of the scroll clamp.
     #[test]
     fn text_surface_with_zero_scroll_shows_from_top() {
-        use crate::surface::TextSurface;
+        use crate::producer::Plain;
         use crate::view::ViewTuiNode;
         let mut nodes = Vec::new();
         let root = create_root(|| {
-            let surface = TextSurface::from_text("line 0\nline 1\nline 2\nline 3\nline 4");
+            let producer: Box<dyn CellProducer> = Box::new(Plain::new("line 0\nline 1\nline 2\nline 3\nline 4"));
             let view: View = tags::div()
                 .width(10)
                 .height(4)
                 .overflow(taffy::style::Overflow::Hidden)
-                .children(View::from_node(TuiNode::create_text_surface_node(
-                    surface, 0,
-                )))
+                .children(View::from_node(TuiNode::create_leaf_node(producer, 0)))
                 .into();
             nodes = view.nodes.into_iter().collect();
         });
-        let (canvas, _index) = render(&nodes, Rect::new(0, 0, 12, 6), None);
-        let painted = canvas_to_plain_text(&canvas);
+        let (fb, _index) = render(&nodes, Rect::new(0, 0, 12, 6), None);
+        let painted = canvas_to_plain_text(&fb);
         assert!(
             painted.contains("line 0"),
             "scroll 0 shows the first line: {painted}"
@@ -1335,13 +1024,13 @@ mod tests {
             .first()
             .copied()
             .expect("button should be focusable");
-        let (canvas, _index) = render(&nodes, Rect::new(0, 0, 12, 5), Some(focused));
+        let (fb, _index) = render(&nodes, Rect::new(0, 0, 12, 5), Some(focused));
 
         let mut seven = None;
-        for y in 0..canvas.height() {
-            for x in 0..canvas.width() {
-                if let Some(cell) = canvas.cell(x, y)
-                    && let Some(character) = &cell.character
+        for y in 0..fb.height() {
+            for x in 0..fb.width() {
+                if let Some(cell) = fb.cell(x as i32, y as i32)
+                    && let Some(character) = &cell.glyph
                     && character.value == "7"
                 {
                     seven = Some(character);
@@ -1360,21 +1049,10 @@ mod tests {
         root.dispose();
     }
 
-    fn canvas_to_plain_text(canvas: &Canvas) -> String {
-        let mut out = String::new();
-        for y in 0..canvas.height() {
-            for x in 0..canvas.width() {
-                if let Some(cell) = canvas.cell(x, y)
-                    && let Some(ch) = &cell.character
-                {
-                    out.push_str(&ch.value);
-                } else {
-                    out.push(' ');
-                }
-            }
-            out.push('\n');
-        }
-        out
+    fn canvas_to_plain_text(fb: &Framebuffer) -> String {
+        // Delegates to the `Display` impl, which flattens the framebuffer to
+        // unstyled plain text (one '\n'-terminated line per row).
+        fb.to_string()
     }
 
     /// An absolutely-positioned element with a `background_color` must cover the
@@ -1409,8 +1087,8 @@ mod tests {
             nodes = view.nodes.into_iter().collect();
         });
 
-        let (canvas, _index) = render(&nodes, Rect::new(0, 0, 24, 3), None);
-        let row0 = canvas_to_plain_text(&canvas)
+        let (fb, _index) = render(&nodes, Rect::new(0, 0, 24, 3), None);
+        let row0 = canvas_to_plain_text(&fb)
             .lines()
             .next()
             .unwrap()
@@ -1462,8 +1140,8 @@ mod tests {
             nodes = view.nodes.into_iter().collect();
         });
 
-        let (canvas, _index) = render(&nodes, Rect::new(0, 0, 20, 4), None);
-        let painted = canvas_to_plain_text(&canvas);
+        let (fb, _index) = render(&nodes, Rect::new(0, 0, 20, 4), None);
+        let painted = canvas_to_plain_text(&fb);
 
         assert!(
             painted
@@ -1482,44 +1160,51 @@ mod tests {
 
     #[test]
     fn text_surface_layout_breaks_at_width() {
-        use crate::surface::{TextRow, TextSegment, TextSurface};
+        use crate::producer::Plain;
 
-        let surface = TextSurface::from_row(TextRow::from(TextSegment::raw("abcdef")));
-        let layout = surface.layout(3, SpanStyle::default());
+        let rows = Plain::new("abcdef").render(3);
 
-        assert_eq!(layout.height(), 2);
-        assert_eq!(layout.rows()[0].segments[0].content, "a");
-        assert_eq!(layout.rows()[0].segments[1].content, "b");
-        assert_eq!(layout.rows()[0].segments[2].content, "c");
-        assert_eq!(layout.rows()[1].segments[0].content, "d");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0][0].glyph.as_ref().unwrap().value, "a");
+        assert_eq!(rows[0][1].glyph.as_ref().unwrap().value, "b");
+        assert_eq!(rows[0][2].glyph.as_ref().unwrap().value, "c");
+        assert_eq!(rows[1][0].glyph.as_ref().unwrap().value, "d");
     }
 
     #[test]
     fn text_surface_layout_resolves_segment_style_patched_on_base() {
-        use crate::surface::{TextRow, TextSegment, TextSurface};
+        use crate::producer::Lines;
         use crate::text::{Modifier, SpanStyle};
 
-        let surface = TextSurface::from_row(TextRow::from_segments(vec![
-            TextSegment::raw("a"),
-            TextSegment::styled(
-                "b",
+        // Lines with styled runs; style is per-glyph, not inherited from a
+        // parent "base style" — each glyph carries its run's style directly.
+        let rows = Lines::new(vec![vec![
+            ("a".to_string(), SpanStyle::default()),
+            (
+                "b".to_string(),
                 SpanStyle {
                     add_modifier: Modifier::BOLD,
                     ..SpanStyle::default()
                 },
             ),
-        ]));
-        let layout = surface.layout(10, SpanStyle::default());
+        ]])
+        .render(10);
 
-        assert_eq!(layout.height(), 1);
+        assert_eq!(rows.len(), 1);
         assert!(
-            !layout.rows()[0].segments[0]
+            !rows[0][0]
+                .glyph
+                .as_ref()
+                .unwrap()
                 .style
                 .add_modifier
                 .contains(Modifier::BOLD)
         );
         assert!(
-            layout.rows()[0].segments[1]
+            rows[0][1]
+                .glyph
+                .as_ref()
+                .unwrap()
                 .style
                 .add_modifier
                 .contains(Modifier::BOLD)
@@ -1528,16 +1213,14 @@ mod tests {
 
     #[test]
     fn text_surface_measures_wrapped_height() {
-        use crate::surface::{TextRow, TextSegment, TextSurface};
+        use crate::producer::Plain;
         use crate::view::ViewTuiNode;
         let mut nodes = Vec::new();
         let root = crate::reactive::create_root(|| {
+            let producer: Box<dyn CellProducer> = Box::new(Plain::new("abcdef"));
             let view: View = tags::div()
                 .width(3)
-                .children(View::from_node(TuiNode::create_text_surface_node(
-                    TextSurface::from_row(TextRow::from(TextSegment::raw("abcdef"))),
-                    0,
-                )))
+                .children(View::from_node(TuiNode::create_leaf_node(producer, 0)))
                 .into();
             nodes = view.nodes.into_iter().collect();
         });
@@ -1547,18 +1230,12 @@ mod tests {
 
     #[test]
     fn text_surface_paints_scroll_window_only() {
-        use crate::surface::{TextRow, TextSurface};
+        use crate::producer::Plain;
         use crate::view::ViewTuiNode;
         let mut nodes = Vec::new();
         let root = crate::reactive::create_root(|| {
-            let surface = TextSurface::from_rows(vec![
-                TextRow::raw("a"),
-                TextRow::raw("b"),
-                TextRow::raw("c"),
-                TextRow::raw("d"),
-                TextRow::raw("e"),
-            ]);
-            let leaf = TuiNode::create_text_surface_node(surface, 1);
+            let producer: Box<dyn CellProducer> = Box::new(Plain::new("a\nb\nc\nd\ne"));
+            let leaf = TuiNode::create_leaf_node(producer, 1);
             let view: View = tags::div()
                 .width(5)
                 .height(2)
@@ -1567,8 +1244,8 @@ mod tests {
                 .into();
             nodes = view.nodes.into_iter().collect();
         });
-        let (canvas, _index) = render(&nodes, Rect::new(0, 0, 5, 2), None);
-        let painted = canvas_to_plain_text(&canvas);
+        let (fb, _index) = render(&nodes, Rect::new(0, 0, 5, 2), None);
+        let painted = canvas_to_plain_text(&fb);
         assert!(painted.contains('b'), "offset row 0 visible: {painted}");
         assert!(painted.contains('c'), "offset row 1 visible: {painted}");
         assert!(
@@ -1581,35 +1258,38 @@ mod tests {
 
     #[test]
     fn text_surface_paints_per_segment_styles() {
-        use crate::surface::{TextRow, TextSegment};
+        use crate::producer::Lines;
         use crate::text::SpanStyle;
         let mut nodes = Vec::new();
         let root = crate::reactive::create_root(|| {
-            let row = TextRow::from_segments(vec![
-                TextSegment::raw("plain "),
-                TextSegment::styled(
-                    "bold",
+            let rows = Lines::new(vec![vec![
+                ("plain ".to_string(), SpanStyle::default()),
+                (
+                    "bold".to_string(),
                     SpanStyle {
                         add_modifier: crate::text::Modifier::BOLD,
                         ..SpanStyle::default()
                     },
                 ),
-                TextSegment::styled(
-                    " red",
+                (
+                    " red".to_string(),
                     SpanStyle {
                         fg: Some(crate::Color::Red),
                         ..SpanStyle::default()
                     },
                 ),
-            ]);
-            let view: View = tags::div().width(20).children(View::from(row)).into();
+            ]]);
+            let view: View = tags::div()
+                .width(20)
+                .children(View::leaf(Box::new(rows)))
+                .into();
             nodes = view.nodes.into_iter().collect();
         });
-        let (canvas, _index) = render(&nodes, Rect::new(0, 0, 20, 1), None);
+        let (fb, _index) = render(&nodes, Rect::new(0, 0, 20, 1), None);
         // "plain " occupies cols 0..6, "bold" cols 6..10, " red" cols 10..14.
-        let plain_cell = canvas.cell(0, 0).unwrap().character.as_ref().unwrap();
-        let bold_cell = canvas.cell(6, 0).unwrap().character.as_ref().unwrap();
-        let red_cell = canvas.cell(10, 0).unwrap().character.as_ref().unwrap();
+        let plain_cell = fb.cell(0, 0).unwrap().glyph.as_ref().unwrap();
+        let bold_cell = fb.cell(6, 0).unwrap().glyph.as_ref().unwrap();
+        let red_cell = fb.cell(10, 0).unwrap().glyph.as_ref().unwrap();
         assert_eq!(plain_cell.value, "p");
         assert!(
             !plain_cell
@@ -1629,28 +1309,28 @@ mod tests {
 
     #[test]
     fn text_surface_places_ascii_after_cjk_by_display_width() {
-        use crate::surface::TextRow;
+        use crate::producer::Plain;
         let mut nodes = Vec::new();
         let root = crate::reactive::create_root(|| {
             let view: View = tags::div()
                 .width(6)
-                .children(View::from(TextRow::raw("好XY")))
+                .children(View::leaf(Box::new(Plain::new("好XY"))))
                 .into();
             nodes = view.nodes.into_iter().collect();
         });
-        let (canvas, _index) = render(&nodes, Rect::new(0, 0, 6, 1), None);
+        let (fb, _index) = render(&nodes, Rect::new(0, 0, 6, 1), None);
 
         assert_eq!(
-            canvas.cell(0, 0).unwrap().character.as_ref().unwrap().value,
+            fb.cell(0, 0).unwrap().glyph.as_ref().unwrap().value,
             "好"
         );
-        assert!(canvas.cell(1, 0).unwrap().character.is_none());
+        assert!(fb.cell(1, 0).unwrap().glyph.is_none());
         assert_eq!(
-            canvas.cell(2, 0).unwrap().character.as_ref().unwrap().value,
+            fb.cell(2, 0).unwrap().glyph.as_ref().unwrap().value,
             "X"
         );
         assert_eq!(
-            canvas.cell(3, 0).unwrap().character.as_ref().unwrap().value,
+            fb.cell(3, 0).unwrap().glyph.as_ref().unwrap().value,
             "Y"
         );
         root.dispose();
@@ -1668,8 +1348,8 @@ mod tests {
                 .into();
             nodes = view.nodes.into_iter().collect();
         });
-        let (canvas, _index) = render(&nodes, Rect::new(0, 0, 1, 1), None);
-        let cell = canvas.cell(0, 0).unwrap().character.as_ref().unwrap();
+        let (fb, _index) = render(&nodes, Rect::new(0, 0, 1, 1), None);
+        let cell = fb.cell(0, 0).unwrap().glyph.as_ref().unwrap();
         assert!(cell.style.add_modifier.contains(crate::text::Modifier::DIM));
         assert!(
             cell.style
@@ -1681,26 +1361,28 @@ mod tests {
 
     #[test]
     fn text_surface_wrap_carries_style_across_break() {
-        use crate::surface::{TextRow, TextSegment};
+        use crate::producer::Plain;
         use crate::text::{Modifier, SpanStyle};
-        // One span "ABCDEF" styled BOLD, width 3 → two rows "ABC" / "DEF".
+        // One styled string "ABCDEF" with BOLD, width 3 → two rows "ABC" / "DEF".
         // Both rows' graphemes must carry BOLD.
         let mut nodes = Vec::new();
         let root = crate::reactive::create_root(|| {
-            let row = TextRow::from_segments(vec![TextSegment::styled(
-                "ABCDEF",
-                SpanStyle {
-                    add_modifier: Modifier::BOLD,
-                    ..SpanStyle::default()
-                },
-            )]);
-            let view: View = tags::div().width(3).children(View::from(row)).into();
+            let view: View = tags::div()
+                .width(3)
+                .children(View::leaf(Box::new(Plain::styled(
+                    "ABCDEF",
+                    SpanStyle {
+                        add_modifier: Modifier::BOLD,
+                        ..SpanStyle::default()
+                    },
+                ))))
+                .into();
             nodes = view.nodes.into_iter().collect();
         });
-        let (canvas, _index) = render(&nodes, Rect::new(0, 0, 3, 2), None);
+        let (fb, _index) = render(&nodes, Rect::new(0, 0, 3, 2), None);
         for y in 0..2 {
             for x in 0..3 {
-                let cell = canvas.cell(x, y).unwrap().character.as_ref().unwrap();
+                let cell = fb.cell(x as i32, y as i32).unwrap().glyph.as_ref().unwrap();
                 assert!(
                     cell.style.add_modifier.contains(Modifier::BOLD),
                     "grapheme at ({x},{y}) should be bold: {:?}",
@@ -1713,16 +1395,15 @@ mod tests {
 
     #[test]
     fn element_with_text_surface_child_is_text_leaf() {
-        use crate::surface::TextSurface;
         let mut nodes = Vec::new();
         let root = crate::reactive::create_root(|| {
             let view: View = tags::button()
-                .children(View::from(TextSurface::from_text("hi")))
+                .children(View::leaf(Box::new(crate::producer::Plain::new("hi"))))
                 .into();
             nodes = view.nodes.into_iter().collect();
         });
-        let (canvas, _index) = render(&nodes, Rect::new(0, 0, 10, 1), None);
-        let painted = canvas_to_plain_text(&canvas);
+        let (fb, _index) = render(&nodes, Rect::new(0, 0, 10, 1), None);
+        let painted = canvas_to_plain_text(&fb);
         assert!(
             painted.contains("[ hi ]"),
             "button chrome should paint: {painted}"
@@ -1775,8 +1456,8 @@ mod tests {
                 .into();
             nodes = view.nodes.into_iter().collect();
         });
-        let (canvas, _index) = render(&nodes, Rect::new(0, 0, 40, 10), None);
-        let painted = canvas_to_plain_text(&canvas);
+        let (fb, _index) = render(&nodes, Rect::new(0, 0, 40, 10), None);
+        let painted = canvas_to_plain_text(&fb);
 
         assert!(
             !painted.contains("SHOULD-BE-COVERED"),
@@ -1833,8 +1514,8 @@ mod tests {
             nodes = view.nodes.into_iter().collect();
         });
         // 10 rows: transcript fills 9, prompt on row 9 (the last).
-        let (canvas, _index) = render(&nodes, Rect::new(0, 0, 40, 10), None);
-        let painted = canvas_to_plain_text(&canvas);
+        let (fb, _index) = render(&nodes, Rect::new(0, 0, 40, 10), None);
+        let painted = canvas_to_plain_text(&fb);
         let lines: Vec<&str> = painted.lines().collect();
 
         assert_eq!(lines.len(), 10);
@@ -1884,8 +1565,8 @@ mod tests {
             nodes = view.nodes.into_iter().collect();
         });
         // 80×24 → 12.5% = 10 cols / 3 rows of margin.
-        let (canvas, _index) = render(&nodes, Rect::new(0, 0, 80, 24), None);
-        let painted = canvas_to_plain_text(&canvas);
+        let (fb, _index) = render(&nodes, Rect::new(0, 0, 80, 24), None);
+        let painted = canvas_to_plain_text(&fb);
 
         // The top border (╭) sits at row 3 (12.5% of 24 ≈ 3) and column 10
         // (12.5% of 80 = 10) — not at (0,0), which would mean the percentage

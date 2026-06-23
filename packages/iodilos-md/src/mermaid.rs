@@ -5,8 +5,8 @@
 
 use std::fmt::Write;
 
-use iodilos::surface::TextSegment;
 use iodilos::text::SpanStyle;
+
 use mmdflux::{OutputFormat, RenderConfig, render_diagram};
 
 use crate::theme::MarkdownTheme;
@@ -82,7 +82,7 @@ fn render_pie(content: &str) -> Option<String> {
     Some(out)
 }
 
-pub(crate) fn colorize_line(line: &str, theme: &MarkdownTheme) -> Vec<TextSegment> {
+pub(crate) fn colorize_line(line: &str, theme: &MarkdownTheme) -> Vec<(String, SpanStyle)> {
     let keyword_style = SpanStyle {
         fg: Some(theme.mermaid_keyword),
         ..SpanStyle::default()
@@ -100,7 +100,7 @@ pub(crate) fn colorize_line(line: &str, theme: &MarkdownTheme) -> Vec<TextSegmen
         ..SpanStyle::default()
     };
 
-    let mut spans: Vec<TextSegment> = Vec::new();
+    let mut spans: Vec<(String, SpanStyle)> = Vec::new();
     let mut rest = line;
 
     while !rest.is_empty() {
@@ -118,13 +118,11 @@ pub(crate) fn colorize_line(line: &str, theme: &MarkdownTheme) -> Vec<TextSegmen
             let after_pipe = &rest[pos + 1..];
             if let Some(end) = after_pipe.find('|') {
                 let label_content = &after_pipe[..end];
-                spans.push(TextSegment::styled(
-                    format!("|{label_content}|"),
-                    label_style,
-                ));
+                spans.push((format!("|{label_content}|"),
+                    label_style, ));
                 rest = &after_pipe[end + 1..];
             } else {
-                spans.push(TextSegment::styled("|".to_string(), default_style));
+                spans.push(("|".to_string(), default_style));
                 rest = after_pipe;
             }
             continue;
@@ -135,7 +133,7 @@ pub(crate) fn colorize_line(line: &str, theme: &MarkdownTheme) -> Vec<TextSegmen
     }
 
     if spans.is_empty() {
-        spans.push(TextSegment::styled(line.to_string(), default_style));
+        spans.push((line.to_string(), default_style));
     }
     spans
 }
@@ -145,14 +143,14 @@ fn tokenize_segment(
     keyword_style: SpanStyle,
     arrow_style: SpanStyle,
     default_style: SpanStyle,
-    spans: &mut Vec<TextSegment>,
+    spans: &mut Vec<(String, SpanStyle)>,
 ) {
     let mut i = 0;
     let bytes = segment.as_bytes();
 
     while i < bytes.len() {
         if let Some((arrow, len)) = try_match_arrow(&segment[i..]) {
-            spans.push(TextSegment::styled(arrow.to_string(), arrow_style));
+            spans.push((arrow.to_string(), arrow_style));
             i += len;
             continue;
         }
@@ -170,7 +168,7 @@ fn tokenize_segment(
             } else {
                 default_style
             };
-            spans.push(TextSegment::styled(word.to_string(), style));
+            spans.push((word.to_string(), style));
             continue;
         }
 
@@ -191,10 +189,8 @@ fn tokenize_segment(
             }
         }
         if i > start {
-            spans.push(TextSegment::styled(
-                segment[start..i].to_string(),
-                default_style,
-            ));
+            spans.push((segment[start..i].to_string(),
+                default_style, ));
         }
     }
 }

@@ -154,3 +154,148 @@ impl<V> Children<V> {
         Self { f: Box::new(f) }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::framebuffer::Rect;
+    use crate::layout::render as render_buffer;
+    use crate::prelude::*;
+    use crate::reactive::create_root;
+
+    // A plain-fn component parameterised by a `#[derive(Props)]` struct. No
+    // `#[component]` attribute yet — the blanket `Component` impl for
+    // `FnOnce(Props) -> View` is enough. This validates the keystone: the derive
+    // generates the typed builder, `view!`'s component codegen calls the setters,
+    // and `Component::create` invokes the fn.
+    #[derive(Props)]
+    struct GreetingProps {
+        name: String,
+    }
+
+    #[allow(non_snake_case)]
+    fn Greeting(props: GreetingProps) -> View {
+        view! {
+            p { "Hello, " (props.name) }
+        }
+    }
+
+    #[test]
+    fn derive_props_component_builds_and_invokes_from_view_macro() {
+        let mut nodes = Vec::new();
+        let root = create_root(|| {
+            let view: View = view! {
+                Greeting(name = String::from("world"))
+            };
+            nodes = view.nodes.into_iter().collect();
+        });
+
+        let (fb, _index) = render_buffer(&nodes, Rect::new(0, 0, 20, 3), None);
+        let painted = fb.to_string();
+        assert!(painted.contains("Hello"), "label painted: {painted}");
+        assert!(painted.contains("world"), "name prop painted: {painted}");
+        root.dispose();
+    }
+
+    // Optional + defaulted fields: `#[prop(default)]` and `Option<T>` auto-strip
+    // must both flow through the builder.
+    #[derive(Props)]
+    struct OptionalProps {
+        required: i32,
+        #[prop(default)]
+        defaulted: i32,
+        maybe: Option<String>,
+    }
+
+    #[allow(non_snake_case)]
+    fn Optional(props: OptionalProps) -> View {
+        // Compose outside the view! closure so we only consume `props` once.
+        let label = format!(
+            "{}-{}-{}",
+            props.required,
+            props.defaulted,
+            props.maybe.as_deref().unwrap_or("")
+        );
+        view! {
+            p { (label) }
+        }
+    }
+
+    #[test]
+    fn derive_props_optional_and_default_fields() {
+        let mut nodes = Vec::new();
+        let root = create_root(|| {
+            // `defaulted` omitted (uses default 0); `maybe` omitted (auto-stripped Option → None).
+            let view: View = view! {
+                Optional(required = 42)
+            };
+            nodes = view.nodes.into_iter().collect();
+        });
+
+        let (fb, _index) = render_buffer(&nodes, Rect::new(0, 0, 20, 1), None);
+        let painted = fb.to_string();
+        assert!(painted.contains("42"), "required painted: {painted}");
+        // required=42, defaulted=0, maybe="" -> "42-0-"
+        assert!(
+            painted.contains("42-0-"),
+            "default (0) and stripped Option (empty) applied: {painted}"
+        );
+        root.dispose();
+    }
+
+    // The `#[component]` attribute on a sync fn: validates the signature and
+    // marks it as a component. Functionally equivalent to a plain fn (the
+    // blanket `Component` impl already applies), but this confirms the macro
+    // round-trips and stays in scope from the prelude.
+    #[derive(Props)]
+    struct CounterProps {
+        value: i32,
+    }
+
+    #[component]
+    fn Counter(props: CounterProps) -> View {
+        view! {
+            p { "count="(props.value) }
+        }
+    }
+
+    #[test]
+    fn component_attribute_on_sync_fn() {
+        let mut nodes = Vec::new();
+        let root = create_root(|| {
+            let view: View = view! {
+                Counter(value = 7)
+            };
+            nodes = view.nodes.into_iter().collect();
+        });
+        let (fb, _index) = render_buffer(&nodes, Rect::new(0, 0, 20, 1), None);
+        let painted = fb.to_string();
+        assert!(painted.contains("count=7"), "component fn painted: {painted}");
+        root.dispose();
+    }
+
+    // `#[component(inline_props)]`: no separate `#[derive(Props)]` struct — the
+    // macro synthesises `Banner_Props { title, count }` from the fn params and
+    // rewrites the body to destructure it.
+    #[component(inline_props)]
+    fn Banner(title: String, count: i32) -> View {
+        view! {
+            p { (title)": "(count) }
+        }
+    }
+
+    #[test]
+    fn component_inline_props_synthesises_props_struct() {
+        let mut nodes = Vec::new();
+        let root = create_root(|| {
+            let view: View = view! {
+                Banner(title = String::from("Items"), count = 3)
+            };
+            nodes = view.nodes.into_iter().collect();
+        });
+        let (fb, _index) = render_buffer(&nodes, Rect::new(0, 0, 20, 1), None);
+        let painted = fb.to_string();
+        assert!(painted.contains("Items"), "inline_props title painted: {painted}");
+        assert!(painted.contains('3'), "inline_props count painted: {painted}");
+        root.dispose();
+    }
+}

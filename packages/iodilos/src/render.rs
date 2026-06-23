@@ -3,8 +3,8 @@
 //! Owns terminal setup, event intake, reactive dispatch, layout, painting,
 //! buffer diffing, and teardown (ADR-0024 §Render Driver). The paint path is
 //! crossterm only — there is no ratatui `Terminal` or `Buffer`. After layout
-//! and painting produce a [`Canvas`], the driver diffs it against the previous
-//! frame's `Canvas` and emits the minimal ANSI writes (ADR-0024 §12).
+//! and painting produce a [`Framebuffer`], the driver diffs it against the previous
+//! frame's `Framebuffer` and emits the minimal ANSI writes (ADR-0024 §12).
 
 use std::cell::{Cell, RefCell};
 use std::future::Future;
@@ -32,7 +32,7 @@ use futures::future::LocalBoxFuture;
 use futures::stream::{FusedStream, FuturesUnordered};
 use futures::{FutureExt as _, StreamExt as _, select};
 
-use crate::canvas::{Canvas, Rect};
+use crate::framebuffer::{Framebuffer, Rect};
 use crate::events::{Event, EventKind};
 use crate::layout::{RuntimeIndex, render as render_buffer};
 use crate::node::{NodeId, SharedHandler, TuiNode};
@@ -83,7 +83,7 @@ impl Future for RedrawFuture {
 
 struct RenderState {
     stdout: Stdout,
-    prev: Option<Canvas>,
+    prev: Option<Framebuffer>,
     nodes: Vec<TuiNode>,
     index: RuntimeIndex,
     focused: Option<NodeId>,
@@ -291,132 +291,59 @@ impl RenderState {
     }
 }
 
-/// Diff `prev` against `next` and emit only the changed cells via crossterm.
+/// Diff `prev` against `next` and emit only the changed rows.
 ///
-/// For each cell that differs, move the cursor to that cell and re-emit it
-/// with its style deltas. This is the terminal cell-buffer diff from
-/// ADR-0024 §12 over the self-built `Canvas` rather than a ratatui `Buffer`.
-/// Reseed the diff pass's running `background` / `text_style` trackers to
-/// reflect the terminal state a given `prev` cell left behind. The trackers
-/// normally describe whatever the *last emitted* cell in the diff pass set, but
-/// when a changed cell is the first one touched on a line (or follows a run of
-/// unchanged cells), that's some other cell's state — not this cell's.
+/// This is the in-window row diff (ADR-0024 §12), ported from oh-my-pi's
+/// differential-rendering strategy: each screen row is compared as a whole,
+/// and the contiguous envelope of changed rows `[first_changed, last_changed]`
+/// is rewritten in place. Within that envelope the cursor is positioned once
+/// at the first changed row (column 0) and successive rows are separated by
+/// `\r\n` — no per-cell absolute cursor addressing. Each rewritten row is an
+/// independent, reset-terminated unit produced by [`Framebuffer::render_row`],
+/// so SGR state never bleeds across rows and a row that lost an inline-code or
+/// panel background resets it before drawing its first glyph.
 ///
-/// Per-cell painting applies `character.style.bg` first, then
-/// `background_color` overrides it, so the effective terminal background of a
-/// previously-painted cell is `background_color` if set, else the character's
-/// `style.bg`, else `None`.
-fn reseed_trackers(
-    prev_cell: Option<&crate::canvas::CanvasCell>,
-    background: &mut Option<crate::Color>,
-    text_style: &mut crate::text::SpanStyle,
-) {
-    use crate::canvas::CanvasCell;
-    let empty = CanvasCell::default();
-    let prev = prev_cell.unwrap_or(&empty);
-    let effective_bg = prev.background_color.or_else(|| {
-        prev.character
-            .as_ref()
-            .and_then(|c| c.style.bg)
-    });
-    *background = effective_bg;
-    *text_style = prev
-        .character
-        .as_ref()
-        .map(|c| c.style)
-        .unwrap_or_default();
-    // The character's style.bg is folded into `effective_bg` / tracked via the
-    // bg field; keep text_style.bg consistent with the effective background so
-    // the per-attribute checks treat them coherently.
-    text_style.bg = effective_bg;
-}
-
-fn diff_and_draw<W: Write>(w: &mut W, prev: &Canvas, next: &Canvas) -> io::Result<()> {
+/// On a size mismatch the previous frame no longer describes the screen, so
+/// the whole framebuffer is cleared (`CSI 2J`) and repainted via
+/// [`Framebuffer::write_ansi`].
+fn diff_and_draw<W: Write>(w: &mut W, prev: &Framebuffer, next: &Framebuffer) -> io::Result<()> {
     use crossterm::csi;
-    use crossterm::style::{Color, SetBackgroundColor, SetForegroundColor};
 
     if prev.size() != next.size() {
         write!(w, csi!("2J"))?;
         return next.write_ansi(w);
     }
 
-    let width = next.width();
     let height = next.height();
-    let mut background = None;
-    let mut text_style = crate::text::SpanStyle::default();
-
+    let width = next.width();
+    // Find the inclusive envelope of rows that differ. A row differs if any of
+    // its cells changed (compared as a whole slice, so a wide glyph that now
+    // spans the boundary still marks its row changed).
+    let mut first_changed: Option<i32> = None;
+    let mut last_changed = 0i32;
     for y in 0..height {
-        for x in 0..width {
-            if next.cell_is_wide_continuation(x, y) {
-                continue;
-            }
-            let prev_cell = prev.cell(x, y);
-            let next_cell = next.cell(x, y);
-            if prev_cell == next_cell {
-                continue;
-            }
-            let Some(cell) = next_cell else { continue };
-            // Position the cursor explicitly at this cell.
-            write!(w, csi!("{};{}H"), y + 1, x + 1)?;
-            // The terminal currently shows `prev_cell` at this position (the
-            // previous frame's output). The `background`/`text_style` trackers
-            // describe whatever the *last emitted* cell in this diff pass left
-            // behind — which is NOT necessarily this cell's prior state. So that
-            // the per-attribute "did it change?" checks below compare against
-            // what's really on screen here, reseed the trackers from
-            // `prev_cell`'s effective terminal state before emitting. Without
-            // this, a cell that lost its inline-code background (now plain,
-            // `style.bg == None`) would match the tracker's `None` and skip the
-            // bg reset — leaving the old DarkGrey block lingering on screen
-            // after a scroll.
-            reseed_trackers(prev_cell, &mut background, &mut text_style);
-            if let Some(ch) = &cell.character {
-                let needs_reset = !ch.style.sub_modifier.is_empty()
-                    || (ch.style.fg.is_none() && text_style.fg.is_some())
-                    || (ch.style.bg.is_none() && text_style.bg.is_some())
-                    || (ch.style.underline_color.is_none() && text_style.underline_color.is_some())
-                    || (ch.style.add_modifier & !text_style.add_modifier).is_empty()
-                        && !text_style.add_modifier.is_empty()
-                        && ch.style.add_modifier != text_style.add_modifier;
-                if needs_reset {
-                    write!(w, csi!("0m"))?;
-                    background = None;
-                    text_style = crate::text::SpanStyle::default();
-                }
-                if ch.style.fg != text_style.fg {
-                    write!(
-                        w,
-                        "{}",
-                        SetForegroundColor(ch.style.fg.unwrap_or(Color::Reset))
-                    )?;
-                }
-                if ch.style.bg != text_style.bg {
-                    write!(
-                        w,
-                        "{}",
-                        SetBackgroundColor(ch.style.bg.unwrap_or(Color::Reset))
-                    )?;
-                }
-                let newly_on = ch.style.add_modifier & !text_style.add_modifier;
-                for attr in crate::canvas::modifier_attributes(newly_on) {
-                    write!(w, csi!("{}m"), attr.sgr())?;
-                }
-                text_style = ch.style;
-            }
-            if cell.background_color != background {
-                write!(
-                    w,
-                    "{}",
-                    SetBackgroundColor(cell.background_color.unwrap_or(Color::Reset))
-                )?;
-                background = cell.background_color;
-            }
-            if let Some(ch) = &cell.character {
-                write!(w, "{}", ch.value)?;
-            } else {
-                w.write_all(b" ")?;
-            }
+        let y = y as i32;
+        if prev.row(y) != next.row(y) {
+            first_changed.get_or_insert(y);
+            last_changed = y;
         }
+    }
+
+    let Some(first) = first_changed else {
+        // Nothing changed: no cursor move, no paint. This is the cheapest frame.
+        return Ok(());
+    };
+
+    // Position the cursor once at the first changed row, column 1, then write
+    // every row in the envelope. Successive rows are separated by `\r\n` (CR
+    // resets the column, LF moves down a row) — the same contiguous-rewrite
+    // scheme oh-my-pi uses, which avoids re-addressing the cursor per row.
+    write!(w, csi!("{};1H"), first + 1)?;
+    for y in first..=last_changed {
+        if y > first {
+            w.write_all(b"\r\n")?;
+        }
+        w.write_all(crate::framebuffer::render_row(next.row(y), width).as_bytes())?;
     }
     write!(w, csi!("0m"))?;
     Ok(())
@@ -653,9 +580,10 @@ fn event_handlers_in_nodes(
                     return Some(handlers);
                 }
             }
-            TuiNode::Dynamic { view, .. } => {
-                let view = view.borrow();
-                if let Some(handlers) = event_handlers_in_nodes(view.nodes.as_slice(), id, name) {
+            TuiNode::Marker {
+                slot: Some(content), ..
+            } => {
+                if let Some(handlers) = event_handlers_in_nodes(&*content.borrow(), id, name) {
                     return Some(handlers);
                 }
             }
@@ -676,9 +604,10 @@ fn attribute_value_in_nodes(nodes: &[TuiNode], id: NodeId, name: &str) -> Option
                     return Some(value);
                 }
             }
-            TuiNode::Dynamic { view, .. } => {
-                let view = view.borrow();
-                if let Some(value) = attribute_value_in_nodes(view.nodes.as_slice(), id, name) {
+            TuiNode::Marker {
+                slot: Some(content), ..
+            } => {
+                if let Some(value) = attribute_value_in_nodes(&*content.borrow(), id, name) {
                     return Some(value);
                 }
             }
@@ -729,7 +658,7 @@ mod tests {
 
     use super::*;
     use crate::attributes::{GlobalAttributes, GlobalAttributesExt};
-    use crate::canvas::{Canvas, Rect};
+    use crate::framebuffer::{Framebuffer, Rect};
     use crate::components::tags;
     use crate::layout::render as render_buffer;
     use crate::text::SpanStyle;
@@ -969,8 +898,8 @@ mod tests {
 
     #[test]
     fn diff_repaints_whole_canvas_when_size_changes() {
-        let prev = Canvas::empty(Rect::new(0, 0, 4, 2));
-        let next = Canvas::empty(Rect::new(0, 0, 2, 1));
+        let prev = Framebuffer::empty(Rect::new(0, 0, 4, 2));
+        let next = Framebuffer::empty(Rect::new(0, 0, 2, 1));
         let mut out = Vec::new();
 
         diff_and_draw(&mut out, &prev, &next).unwrap();
@@ -990,9 +919,9 @@ mod tests {
             fg: Some(Color::Red),
             ..SpanStyle::default()
         };
-        let mut prev = Canvas::empty(Rect::new(0, 0, 2, 1));
+        let mut prev = Framebuffer::empty(Rect::new(0, 0, 2, 1));
         prev.set_text(Rect::new(0, 0, 1, 1), "a", red);
-        let mut next = Canvas::empty(Rect::new(0, 0, 2, 1));
+        let mut next = Framebuffer::empty(Rect::new(0, 0, 2, 1));
         next.set_text(Rect::new(0, 0, 1, 1), "a", red);
         next.set_text(Rect::new(1, 0, 1, 1), "b", red);
 
@@ -1008,9 +937,9 @@ mod tests {
 
     #[test]
     fn diff_skips_wide_char_trailing_cell() {
-        let mut prev = Canvas::empty(Rect::new(0, 0, 4, 1));
+        let mut prev = Framebuffer::empty(Rect::new(0, 0, 4, 1));
         prev.set_text(Rect::new(0, 0, 4, 1), "  XY", SpanStyle::default());
-        let mut next = Canvas::empty(Rect::new(0, 0, 4, 1));
+        let mut next = Framebuffer::empty(Rect::new(0, 0, 4, 1));
         next.set_text(Rect::new(0, 0, 4, 1), "好XY", SpanStyle::default());
 
         let mut out = Vec::new();
@@ -1043,11 +972,11 @@ mod tests {
             bg: Some(Color::DarkGrey),
             ..SpanStyle::default()
         };
-        let mut prev = Canvas::empty(Rect::new(0, 0, 6, 1));
+        let mut prev = Framebuffer::empty(Rect::new(0, 0, 6, 1));
         // "  code  " with DarkGrey background (mirrors inline-code rendering).
         prev.set_text(Rect::new(0, 0, 6, 1), " code ", grey);
 
-        let mut next = Canvas::empty(Rect::new(0, 0, 6, 1));
+        let mut next = Framebuffer::empty(Rect::new(0, 0, 6, 1));
         // After scroll: the same on-screen cells now hold plain text, no bg.
         next.set_text(Rect::new(0, 0, 6, 1), "plain", SpanStyle::default());
 
@@ -1075,12 +1004,12 @@ mod tests {
         use crossterm::style::Color;
         crossterm::style::force_color_output(true);
 
-        let mut prev = Canvas::empty(Rect::new(0, 0, 3, 1));
+        let mut prev = Framebuffer::empty(Rect::new(0, 0, 3, 1));
         // A panel painted an opaque background, then plain text on top.
         prev.set_background_color(Rect::new(0, 0, 3, 1), Color::Blue);
         prev.set_text(Rect::new(0, 0, 3, 1), "abc", SpanStyle::default());
 
-        let mut next = Canvas::empty(Rect::new(0, 0, 3, 1));
+        let mut next = Framebuffer::empty(Rect::new(0, 0, 3, 1));
         next.set_text(Rect::new(0, 0, 3, 1), "xyz", SpanStyle::default());
 
         let mut out = Vec::new();
@@ -1096,9 +1025,61 @@ mod tests {
         );
     }
 
+    /// When two frames are byte-identical the row diff finds no changed row and
+    /// emits nothing — no cursor move, no paint. This is the cheapest frame and
+    /// must stay a true no-op.
+    #[test]
+    fn diff_emits_nothing_when_frames_are_identical() {
+        let mut prev = Framebuffer::empty(Rect::new(0, 0, 4, 2));
+        prev.set_text(Rect::new(0, 0, 4, 1), "abcd", SpanStyle::default());
+        let next = prev.clone();
+
+        let mut out = Vec::new();
+        diff_and_draw(&mut out, &prev, &next).unwrap();
+
+        assert!(out.is_empty(), "identical frames must emit nothing: {out:?}");
+    }
+
+    /// The diff rewrites only the contiguous envelope of changed rows. A change
+    /// in the middle row must position the cursor once at that row (not at row
+    /// 1) and must NOT touch the unchanged rows above or below.
+    #[test]
+    fn diff_rewrites_only_the_changed_row_envelope() {
+        let mut prev = Framebuffer::empty(Rect::new(0, 0, 3, 3));
+        prev.set_text(Rect::new(0, 0, 3, 1), "aaa", SpanStyle::default());
+        prev.set_text(Rect::new(0, 1, 3, 1), "bbb", SpanStyle::default());
+        prev.set_text(Rect::new(0, 2, 3, 1), "ccc", SpanStyle::default());
+
+        let mut next = prev.clone();
+        // Only the middle row changes: "bbb" -> "bZb".
+        next.set_text(Rect::new(1, 1, 1, 1), "Z", SpanStyle::default());
+
+        let mut out = Vec::new();
+        diff_and_draw(&mut out, &prev, &next).unwrap();
+        let output = String::from_utf8_lossy(&out);
+
+        // The cursor must be addressed to row 2 (the changed row), not row 1.
+        assert!(
+            output.contains("\x1b[2;1H"),
+            "diff should address the cursor to the changed row 2: {output:?}"
+        );
+        // The unchanged first row's cursor address (row 1) must NOT appear, and
+        // neither should the unchanged last row's (row 3).
+        assert!(
+            !output.contains("\x1b[1;1H"),
+            "diff should not rewrite unchanged row 1: {output:?}"
+        );
+        assert!(
+            !output.contains("\x1b[3;1H"),
+            "diff should not rewrite unchanged row 3: {output:?}"
+        );
+        // The changed glyph must be emitted exactly once.
+        assert_eq!(output.matches('Z').count(), 1, "Z emitted once: {output:?}");
+    }
+
     /// Acceptance test for the crossterm-without-ratatui paint path: a
     /// tui-counter-shaped view (flat style properties, rounded border, dynamic
-    /// text) lays out and paints into the self-built `Canvas`, and the painted
+    /// text) lays out and paints into the self-built `Framebuffer`, and the painted
     /// output contains the counter label and button text.
     #[test]
     fn flat_style_view_paints_into_canvas() {
@@ -1141,7 +1122,7 @@ mod tests {
         let (canvas, _index) = render_buffer(&nodes, Rect::new(0, 0, 24, 8), None);
         let painted = canvas_to_plain_text(&canvas);
 
-        // The dynamic counter value (7) is painted into the self-built Canvas,
+        // The dynamic counter value (7) is painted into the self-built Framebuffer,
         // the label appears inside the padded border, and the flat
         // `border_style` property draws a complete box.
         assert!(painted.contains("Count:"), "label painted: {painted}");
@@ -1161,13 +1142,13 @@ mod tests {
         root.dispose();
     }
 
-    /// Flatten a `Canvas` to plain text for assertions.
-    fn canvas_to_plain_text(canvas: &Canvas) -> String {
+    /// Flatten a `Framebuffer` to plain text for assertions.
+    fn canvas_to_plain_text(canvas: &Framebuffer) -> String {
         let mut out = String::new();
         for y in 0..canvas.height() {
             for x in 0..canvas.width() {
-                if let Some(cell) = canvas.cell(x, y)
-                    && let Some(ch) = &cell.character
+                if let Some(cell) = canvas.cell(x as i32, y as i32)
+                    && let Some(ch) = &cell.glyph
                 {
                     out.push_str(&ch.value);
                 } else {

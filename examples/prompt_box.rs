@@ -85,7 +85,7 @@ fn app() -> View {
             div(flex_grow = 1.0_f32) {}
             (move || {
                 rev.get(); // depend on edits
-                View::from_node(TuiNode::create_text_surface_node(surface.get_clone(), 0))
+                View::from_node(TuiNode::create_leaf_node(Box::new(surface.get_clone()), 0))
             })
         }
     }

@@ -1,9 +1,9 @@
-//! Streaming Markdown viewer demo (TextSurface edition).
+//! Streaming Markdown viewer demo (Lines producer edition).
 //!
 //! A fixed Markdown document is fed in character-by-character (simulating an
 //! LLM token stream). Each tick mutates a `Signal<String>`; a reactive memo
-//! re-renders the markdown into a `TextSurface` at the terminal width. Scroll
-//! offset is a `Signal<i32>`; arrow keys / mouse wheel /
+//! re-renders the markdown into a `Lines` producer at the terminal width.
+//! Scroll offset is a `Signal<i32>`; arrow keys / mouse wheel /
 //! PgUp-PgDn change it; `F` toggles follow-the-tail.
 //!
 //! Keys: ↑/↓ scroll 1 line, PgUp/PgDn scroll a page, wheel scrolls, `F`
@@ -138,7 +138,7 @@ fn app() -> View {
             .borrow_mut()
             .feed_to_surface(&content.get_clone(), width, &theme)
     });
-    let total_lines = create_memo(move || surface.get_clone().row_count() as i32);
+    let total_lines = create_memo(move || surface.get_clone().rows.len() as i32);
     let max_offset =
         create_memo(move || total_lines.get().saturating_sub(visible_rows.get()).max(0));
     let top_offset = create_memo(move || {
@@ -195,8 +195,8 @@ fn app() -> View {
                 border_color = Color::DarkGrey,
             ) {
                 (move || {
-                    View::from_node(TuiNode::create_text_surface_node(
-                        surface.get_clone(),
+                    View::from_node(TuiNode::create_leaf_node(
+                        Box::new(surface.get_clone()),
                         top_offset.get(),
                     ))
                 })

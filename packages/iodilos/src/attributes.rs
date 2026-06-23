@@ -32,6 +32,7 @@ type BoxedEventHandler = Box<dyn FnMut(&Event)>;
 /// `From<T> for MaybeDyn<T>` impl. Every flat style property accepts one of
 /// these (ADR-0024 §7): `padding = 2`, `color = Color::Blue`, or
 /// `padding = pad_signal`.
+#[derive(Clone)]
 pub enum StyleDyn<T: 'static> {
     /// A static value.
     Static(T),
@@ -173,6 +174,7 @@ impl AttributeValue for Box<dyn StylePropValue> {
 
 /// A wrapper that pairs a [`StyleDyn<T>`] with the field it writes to. This is
 /// the concrete storage behind every flat style property.
+#[derive(Clone)]
 pub struct FlatStyle<T: 'static> {
     value: StyleDyn<T>,
     setter: fn(&T, &mut Style),
@@ -190,6 +192,9 @@ impl<T: Clone + 'static> StylePropValue for FlatStyle<T> {
     fn apply(&self, style: &mut Style) {
         let value = self.value.get();
         (self.setter)(&value, style);
+    }
+    fn clone_box(&self) -> Box<dyn StylePropValue> {
+        Box::new(self.clone())
     }
 }
 
@@ -383,6 +388,7 @@ pub trait GlobalAttributesExt: GlobalAttributes {
         (flex_wrap, taffy::style::FlexWrap, flex_wrap);
         (overflow, taffy::style::Overflow, overflow);
         (position, taffy::style::Position, position);
+        (z_index, i32, z_index);
         (width, crate::style::Size, width);
         (height, crate::style::Size, height);
         (min_width, crate::style::Size, min_width);

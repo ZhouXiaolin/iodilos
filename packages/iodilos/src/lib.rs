@@ -11,17 +11,17 @@ extern crate self as iodilos;
 
 pub mod attributes;
 pub mod bind;
-pub mod canvas;
+pub mod framebuffer;
 pub mod component;
 pub mod components;
 pub mod events;
 pub mod layout;
 pub mod node;
 pub mod noderef;
+pub mod producer;
 pub mod reactive;
 pub mod render;
 pub mod style;
-pub mod surface;
 pub mod text;
 pub mod view;
 
@@ -31,9 +31,17 @@ pub mod reactive_primitives {
 }
 
 pub use attributes::{Attributes, GlobalAttributes, GlobalAttributesExt, SetAttribute};
+/// The `#[component]` attribute macro for marking fn components.
+pub use iodilos_macros::component;
 pub use component::{Component, Props};
+/// The `Props` derive macro. Coexists with the `Props` trait above under the
+/// same name: derive macros live in the macro namespace, traits in the type
+/// namespace, so `#[derive(Props)]` (macro) and `Props` (trait) never clash.
+pub use iodilos_macros::Props;
 pub use components::completion_menu::{CompletionItem, CompletionMenuProps, completion_menu};
 pub use components::custom_element;
+pub use components::iter::{Indexed, IndexedProps, Keyed, KeyedProps};
+pub use components::show::{Show, ShowProps};
 pub use components::overlay_box::{OverlayBoxProps, OverlayGeometry, overlay_box};
 pub use components::scroll_view::{
     ScrollContent, ScrollViewProps, ScrollWindow, centered_window, scroll_view,
@@ -53,8 +61,7 @@ pub use style::{
     BorderCharacters, BorderStyle, Edges, FlexBasis, Gap, Inset, Margin, Padding, Percent, Size,
     Style, Weight,
 };
-pub use surface::{TextLayout, TextRow, TextSegment, TextSurface, VisualRow, VisualSegment};
-pub use text::{Alignment, Modifier, SpanStyle};
+pub use text::{Modifier, SpanStyle};
 pub use view::{View, ViewNode, ViewTuiNode};
 
 /// The color type, re-exported from crossterm — the single point where the
@@ -71,7 +78,7 @@ pub mod prelude {
     pub use crate::component::{Component, Props};
     pub use crate::reactive::*;
     pub use crossterm::style::Color;
-    pub use iodilos_macros::view;
+    pub use iodilos_macros::{Props, component, view};
     pub use taffy::style::{
         AlignContent, AlignItems, Display, FlexDirection, FlexWrap, JustifyContent, Overflow,
         Position,
@@ -81,7 +88,9 @@ pub mod prelude {
     pub use crate::components::completion_menu::{
         CompletionItem, CompletionMenuProps, completion_menu,
     };
+    pub use crate::components::iter::{Indexed, IndexedProps, Keyed, KeyedProps};
     pub use crate::components::overlay_box::{OverlayBoxProps, OverlayGeometry, overlay_box};
+    pub use crate::components::show::{Show, ShowProps};
     pub use crate::components::scroll_view::{
         ScrollContent, ScrollViewProps, ScrollWindow, centered_window, scroll_view,
     };
@@ -100,8 +109,8 @@ pub mod prelude {
         BorderCharacters, BorderStyle, Edges, FlexBasis, Gap, Inset, Margin, Padding, Percent,
         Size, Style, Weight,
     };
-    pub use crate::surface::{TextRow, TextSegment, TextSurface};
-    pub use crate::text::{Alignment, Modifier, SpanStyle};
+    pub use crate::producer::{CellProducer, Plain};
+    pub use crate::text::{Modifier, SpanStyle};
     pub use crate::view::{View, ViewNode, ViewTuiNode};
     pub use crate::{bind, events};
 }
@@ -110,6 +119,11 @@ pub mod prelude {
 #[doc(hidden)]
 pub mod rt {
     pub use crate::component::{Component, Props, component_scope, element_like_component_builder};
+    // The `Props` derive macro re-exported at the same path as the `Props` trait
+    // above, so that generated code (`#[derive(::iodilos::rt::Props)]` from
+    // `inline_props`) resolves the derive. Different namespaces: the trait lives
+    // in the type namespace, the derive in the macro namespace.
+    pub use iodilos_macros::Props;
     pub use crate::reactive::*;
 
     pub use crate::attributes::{Attributes, GlobalAttributes, GlobalAttributesExt, SetAttribute};

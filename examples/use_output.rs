@@ -1,6 +1,13 @@
+//! Placeholder for an `iocraft`-style `use_output` hook (not yet implemented in
+//! iodilos). The example just renders the visual shell so you can see what the
+//! final demo will look like.
+//!
+//! Run with: `cargo run --example use_output`.
+
 use iodilos::prelude::*;
 
-fn app() -> View {
+#[component]
+fn App() -> View {
     view! {
         div(flex_direction = FlexDirection::Column, gap = 1, padding = 1) {
             div(border_style = BorderStyle::Round, border_color = Color::Green) {
@@ -14,5 +21,5 @@ fn app() -> View {
 }
 
 fn main() -> std::io::Result<()> {
-    render(app)
+    render(App)
 }

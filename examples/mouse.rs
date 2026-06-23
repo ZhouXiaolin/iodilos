@@ -1,3 +1,12 @@
+//! Mouse-driven swatches + a draggable box, fully decomposed into components.
+//!
+//! Run with: `cargo run --example mouse`
+//!
+//! Every interactive piece is a `#[component(inline_props)]`: `Swatch` per color
+//! tile, `DragBox` for the draggable element, plus the small `Toolbar` /
+//! `Stage` containers that compose them. The top-level event wiring stays in
+//! `App` since it owns the shared signals.
+
 use crossterm::event::{KeyCode, KeyEventKind, MouseEventKind};
 use iodilos::prelude::*;
 
@@ -16,7 +25,9 @@ enum DragState {
     },
 }
 
-fn swatch(
+/// One color tile. Clicking selects it; hovering highlights its border.
+#[component(inline_props)]
+fn Swatch(
     index: u32,
     color: Color,
     label: &'static str,
@@ -43,12 +54,10 @@ fn swatch(
             background_color = color,
             border_style = BorderStyle::Round,
             border_color = border_color,
-            on:click=move |_| selected.set(index),
-            on:mouseover=move |_| hovered.set(Some(index)),
-            on:mouseout=move |_| {
-                if hovered.get() == Some(index) {
-                    hovered.set(None);
-                }
+            on:click = move |_| selected.set(index),
+            on:mouseover = move |_| hovered.set(Some(index)),
+            on:mouseout = move |_| if hovered.get() == Some(index) {
+                hovered.set(None);
             },
         ) {
             p(color = Color::Black, weight = Weight::Bold) { (label) }
@@ -56,7 +65,10 @@ fn swatch(
     }
 }
 
-fn drag_box(color: ReadSignal<Color>, pos: Signal<(i32, i32)>, drag: Signal<DragState>) -> View {
+/// The draggable box. Reacts to `mousedown` / `drag` / `mouseup` and writes
+/// its position into the shared signal.
+#[component(inline_props)]
+fn DragBox(color: ReadSignal<Color>, pos: Signal<(i32, i32)>, drag: Signal<DragState>) -> View {
     view! {
         div(
             width = 10,
@@ -69,19 +81,15 @@ fn drag_box(color: ReadSignal<Color>, pos: Signal<(i32, i32)>, drag: Signal<Drag
             background_color = move || color.get(),
             border_style = BorderStyle::Double,
             border_color = Color::White,
-            on:mousedown=move |event: Event| {
-                let Some(mouse) = event.mouse() else {
-                    return;
-                };
+            on:mousedown = move |event: Event| {
+                let Some(mouse) = event.mouse() else { return; };
                 drag.set(DragState::Dragging {
                     start: (mouse.column as i32, mouse.row as i32),
                     origin: pos.get(),
                 });
             },
-            on:drag=move |event: Event| {
-                let Some(mouse) = event.mouse() else {
-                    return;
-                };
+            on:drag = move |event: Event| {
+                let Some(mouse) = event.mouse() else { return; };
                 if let DragState::Dragging { start, origin } = drag.get() {
                     pos.set((
                         origin.0 + mouse.column as i32 - start.0,
@@ -89,14 +97,53 @@ fn drag_box(color: ReadSignal<Color>, pos: Signal<(i32, i32)>, drag: Signal<Drag
                     ));
                 }
             },
-            on:mouseup=move |_| drag.set(DragState::Idle),
+            on:mouseup = move |_| drag.set(DragState::Idle),
         ) {
             p(color = Color::Black, weight = Weight::Bold) { "DRAG" }
         }
     }
 }
 
-fn app() -> View {
+/// The header bar: instructions + the row of swatches.
+#[component(inline_props)]
+fn Toolbar(selected: Signal<u32>, hovered: Signal<Option<u32>>) -> View {
+    view! {
+        div(
+            flex_direction = FlexDirection::Column,
+            align_items = AlignItems::CENTER,
+            padding_top = 1,
+            padding_bottom = 1,
+            gap = 1,
+        ) {
+            p(color = Color::Grey) { "Click swatches or press 1/2/3. Drag the box. Q to quit." }
+            div(flex_direction = FlexDirection::Row) {
+                Swatch(index = 0, color = PALETTE[0].0, label = PALETTE[0].1, selected = selected, hovered = hovered)
+                Swatch(index = 1, color = PALETTE[1].0, label = PALETTE[1].1, selected = selected, hovered = hovered)
+                Swatch(index = 2, color = PALETTE[2].0, label = PALETTE[2].1, selected = selected, hovered = hovered)
+            }
+        }
+    }
+}
+
+/// The bordered drag stage that owns the absolute-positioned `DragBox`.
+#[component(inline_props)]
+fn Stage(color: ReadSignal<Color>, pos: Signal<(i32, i32)>, drag: Signal<DragState>) -> View {
+    view! {
+        div(
+            flex_grow = 1.0_f32,
+            position = Position::Relative,
+            overflow = Overflow::Hidden,
+            border_style = BorderStyle::Single,
+            border_color = Color::DarkGrey,
+            border_edges = Edges::TOP,
+        ) {
+            DragBox(color = color, pos = pos, drag = drag)
+        }
+    }
+}
+
+#[component]
+fn App() -> View {
     let selected = create_signal(0u32);
     let hovered = create_signal(None::<u32>);
     let pos = create_signal((4i32, 2i32));
@@ -110,54 +157,26 @@ fn app() -> View {
             background_color = Color::Black,
             flex_direction = FlexDirection::Column,
             tabindex = "0",
-            on:raw_key=move |event: Event| {
-                let Some(key) = event.key() else {
-                    return;
-                };
-                if key.kind == KeyEventKind::Release {
-                    return;
-                }
+            on:raw_key = move |event: Event| {
+                let Some(key) = event.key() else { return; };
+                if key.kind == KeyEventKind::Release { return; }
                 if let KeyCode::Char(c @ '1'..='3') = key.code {
                     selected.set((c as u8 - b'1') as u32);
                 }
             },
-            on:raw_mouse=move |event: Event| {
-                let Some(mouse) = event.mouse() else {
-                    return;
-                };
+            on:raw_mouse = move |event: Event| {
+                let Some(mouse) = event.mouse() else { return; };
                 if matches!(mouse.kind, MouseEventKind::Up(_)) {
                     drag.set(DragState::Idle);
                 }
             },
         ) {
-            div(
-                flex_direction = FlexDirection::Column,
-                align_items = AlignItems::CENTER,
-                padding_top = 1,
-                padding_bottom = 1,
-                gap = 1,
-            ) {
-                p(color = Color::Grey) { "Click swatches or press 1/2/3. Drag the box. Q to quit." }
-                div(flex_direction = FlexDirection::Row) {
-                    (swatch(0, PALETTE[0].0, PALETTE[0].1, selected, hovered))
-                    (swatch(1, PALETTE[1].0, PALETTE[1].1, selected, hovered))
-                    (swatch(2, PALETTE[2].0, PALETTE[2].1, selected, hovered))
-                }
-            }
-            div(
-                flex_grow = 1.0_f32,
-                position = Position::Relative,
-                overflow = Overflow::Hidden,
-                border_style = BorderStyle::Single,
-                border_color = Color::DarkGrey,
-                border_edges = Edges::TOP,
-            ) {
-                (drag_box(color, pos, drag))
-            }
+            Toolbar(selected = selected, hovered = hovered)
+            Stage(color = color, pos = pos, drag = drag)
         }
     }
 }
 
 fn main() -> std::io::Result<()> {
-    render(app)
+    render(App)
 }

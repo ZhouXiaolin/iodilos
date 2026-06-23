@@ -1,3 +1,7 @@
+//! A weather widget — every visual block is its own component.
+//!
+//! Run with: `cargo run --example weather` (needs network on first paint).
+
 use std::time::Duration;
 
 use crossterm::event::{KeyCode, KeyEventKind};
@@ -5,6 +9,8 @@ use iodilos::prelude::*;
 use serde::Deserialize;
 use tokio::sync::mpsc;
 use tokio::time::sleep;
+
+// ----- data layer -----------------------------------------------------------
 
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default)]
@@ -136,7 +142,22 @@ async fn fetch_weather_async() -> Result<WeatherData, String> {
         .map_err(|err| format!("weather task failed: {err}"))?
 }
 
-fn loading_view(frame: ReadSignal<usize>) -> View {
+// ----- view components ------------------------------------------------------
+
+/// A one-line label/value pair, both painted on the same flex row.
+#[component(inline_props)]
+fn Field(label: &'static str, value: String) -> View {
+    view! {
+        div(flex_direction = FlexDirection::Row) {
+            p(weight = Weight::Bold) { (label) }
+            p { (value) }
+        }
+    }
+}
+
+/// The animated spinner overlay shown while the fetch is in flight.
+#[component(inline_props)]
+fn Loading(frame: ReadSignal<usize>) -> View {
     const FRAMES: [&str; 10] = ["|", "/", "-", "\\", "|", "/", "-", "\\", "|", "/"];
     let label = create_memo(move || FRAMES[frame.get() % FRAMES.len()].to_string());
 
@@ -153,7 +174,9 @@ fn loading_view(frame: ReadSignal<usize>) -> View {
     }
 }
 
-fn weather_data_view(data: WeatherData) -> View {
+/// The result panel — location header + summary + a few `Field` rows.
+#[component(inline_props)]
+fn WeatherView(data: WeatherData) -> View {
     let title = format!(
         "Weather for {}, {}, {}",
         data.location.city, data.location.region, data.location.country
@@ -196,24 +219,17 @@ fn weather_data_view(data: WeatherData) -> View {
                 div(padding = 1) {
                     p(color = summary_color) { (summary) }
                 }
-                div(flex_direction = FlexDirection::Row) {
-                    p(weight = Weight::Bold) { "Temperature: " }
-                    p { (temperature) }
-                }
-                div(flex_direction = FlexDirection::Row) {
-                    p(weight = Weight::Bold) { "Humidity: " }
-                    p { (humidity) }
-                }
-                div(flex_direction = FlexDirection::Row) {
-                    p(weight = Weight::Bold) { "Chance of Precipitation: " }
-                    p { (precipitation) }
-                }
+                Field(label = "Temperature: ",            value = temperature)
+                Field(label = "Humidity: ",               value = humidity)
+                Field(label = "Chance of Precipitation: ", value = precipitation)
             }
         }
     }
 }
 
-fn error_view(err: String) -> View {
+/// A red error panel.
+#[component(inline_props)]
+fn ErrorBox(message: String) -> View {
     view! {
         div(
             flex_direction = FlexDirection::Column,
@@ -224,12 +240,31 @@ fn error_view(err: String) -> View {
             padding = 2,
         ) {
             p(weight = Weight::Bold, color = Color::Red) { "Error!" }
-            p { (err) }
+            p { (message) }
         }
     }
 }
 
-fn app() -> View {
+/// The bottom statusline.
+#[component]
+fn Status() -> View {
+    view! {
+        div(
+            width = Size::Percent(100.0),
+            border_style = BorderStyle::Single,
+            border_color = Color::DarkGrey,
+            border_edges = Edges::TOP,
+            padding_left = 1,
+        ) {
+            p { "[R] Reload | [Q] Quit" }
+        }
+    }
+}
+
+// ----- top-level app --------------------------------------------------------
+
+#[component]
+fn App() -> View {
     let state = create_signal(WeatherState::Loading);
     let frame = create_signal(0usize);
     let (reload_tx, mut reload_rx) = mpsc::unbounded_channel::<()>();
@@ -261,13 +296,9 @@ fn app() -> View {
             border_color = Color::Cyan,
             flex_direction = FlexDirection::Column,
             tabindex = "0",
-            on:raw_key=move |event: Event| {
-                let Some(key) = event.key() else {
-                    return;
-                };
-                if key.kind == KeyEventKind::Release {
-                    return;
-                }
+            on:raw_key = move |event: Event| {
+                let Some(key) = event.key() else { return; };
+                if key.kind == KeyEventKind::Release { return; }
                 if matches!(key.code, KeyCode::Char('r') | KeyCode::Char('R')) {
                     let _ = reload_tx.send(());
                 }
@@ -275,25 +306,17 @@ fn app() -> View {
         ) {
             div(flex_grow = 1.0_f32, flex_direction = FlexDirection::Column, width = Size::Percent(100.0)) {
                 (move || match state.get_clone() {
-                    WeatherState::Loading => loading_view(*frame),
-                    WeatherState::Loaded(Ok(data)) => weather_data_view(data),
-                    WeatherState::Loaded(Err(err)) => error_view(err),
+                    WeatherState::Loading                  => view! { Loading(frame = *frame) },
+                    WeatherState::Loaded(Ok(data))         => view! { WeatherView(data = data) },
+                    WeatherState::Loaded(Err(err))         => view! { ErrorBox(message = err) },
                 })
             }
-            div(
-                width = Size::Percent(100.0),
-                border_style = BorderStyle::Single,
-                border_color = Color::DarkGrey,
-                border_edges = Edges::TOP,
-                padding_left = 1,
-            ) {
-                p { "[R] Reload | [Q] Quit" }
-            }
+            Status()
         }
     }
 }
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> std::io::Result<()> {
-    render_async(app).await
+    render_async(App).await
 }

@@ -1,10 +1,14 @@
-//! Streaming Markdown viewer demo (Lines producer edition).
+//! Streaming Markdown viewer demo (View-tree edition).
 //!
 //! A fixed Markdown document is fed in character-by-character (simulating an
 //! LLM token stream). Each tick mutates a `Signal<String>`; a reactive memo
-//! re-renders the markdown into a `Lines` producer at the terminal width.
-//! Scroll offset is a `Signal<i32>`; arrow keys / mouse wheel /
-//! PgUp-PgDn change it; `F` toggles follow-the-tail.
+//! re-parses via the streaming parser and builds a **View tree** — paragraphs
+//! are `Spans` leaves that re-wrap at the layout width, code/math blocks are
+//! `div(border_style)` with a `border_title` label. No width guessing: text
+//! reflows for free on resize.
+//!
+//! Scroll is the negative-margin trick: the document column sits inside an
+//! `overflow: hidden` viewport and is translated up by `offset` rows.
 //!
 //! Keys: ↑/↓ scroll 1 line, PgUp/PgDn scroll a page, wheel scrolls, `F`
 //! toggles follow, `Q` quits.
@@ -12,17 +16,16 @@
 use std::time::Duration;
 
 use crossterm::event::{KeyCode, KeyEventKind, MouseEventKind};
-use crossterm::terminal::size as term_size;
-use iodilos::node::TuiNode;
 use iodilos::prelude::*;
-use iodilos_md::{MarkdownTheme, StreamingParser};
+use iodilos_md::{MarkdownTheme, StreamingParser, blocks_height};
 use tokio::time::sleep;
 
 const SAMPLE_MD: &str = "\
 # Streaming Markdown in iodilos
 
-This document renders into a single TextSurface. It is fed character-by-character
-to simulate a live token stream, just like an LLM typing out an answer.
+This document renders into a View tree of framework components. It is fed
+character-by-character to simulate a live token stream, just like an LLM typing
+out an answer. Paragraphs are Spans leaves that re-wrap at the terminal width.
 
 ## Inline styles
 
@@ -40,7 +43,7 @@ Inline math works too: $E = mc^2$ and $x^2 + y^2 = z^2$.
 2. Step two
 
 - [x] Parse Markdown into blocks
-- [x] Render each block to TextSurface
+- [x] Render each block via framework components
 - [ ] Ship to production
 
 ## A quote
@@ -68,23 +71,6 @@ $$
 \\int_{0}^{\\infty} e^{-x^2} dx = \\frac{\\sqrt{\\pi}}{2}
 $$
 
-Fenced LaTeX:
-
-```latex
-\\frac{a+b}{c} = \\sum_{n=0}^{\\infty} x_n
-```
-
-## Mermaid flowchart
-
-```mermaid
-flowchart TD
-    A[Markdown input] --> B{Block type}
-    B -->|latex| C[Unicode math]
-    B -->|mermaid| D[Terminal diagram]
-    C --> E[TextSurface]
-    D --> E
-```
-
 ## A table
 
 | Feature    | Supported |
@@ -92,7 +78,6 @@ flowchart TD
 | Headings   |    yes    |
 | Code       |    yes    |
 | Math       |    yes    |
-| Mermaid    |    yes    |
 | Tables     |    yes    |
 | Inline     |    yes    |
 ";
@@ -100,16 +85,71 @@ flowchart TD
 const CHROME_ROWS: i32 = 3; // status bar + viewport borders
 const WHEEL_LINES: i32 = 5;
 
-fn app() -> View {
+// ----- view components ------------------------------------------------------
+
+/// The bordered scrolling viewport that hosts the markdown document.
+/// `top_offset` translates the document column up by that many rows so the
+/// tail stays in view; the surrounding `overflow: hidden` clips the rest.
+#[component(inline_props)]
+fn Viewport(top_offset: ReadSignal<i32>, children: Children<View>) -> View {
+    let children = children.call();
+    view! {
+        div(
+            flex_grow = 1.0_f32,
+            overflow = Overflow::Hidden,
+            border_style = BorderStyle::Single,
+            border_color = Color::DarkGrey,
+        ) {
+            div(
+                flex_direction = FlexDirection::Column,
+                margin_top = move || Margin::from(-top_offset.get()),
+                padding_left = 1,
+                padding_right = 1,
+            ) {
+                (children)
+            }
+        }
+    }
+}
+
+/// The bottom statusline.
+#[component(inline_props)]
+fn StatusLine(done: ReadSignal<bool>, follow: ReadSignal<bool>) -> View {
+    view! {
+        div(
+            flex_direction = FlexDirection::Row,
+            column_gap = 2,
+            height = 1,
+            border_style = BorderStyle::Single,
+            border_color = Color::DarkGrey,
+            border_edges = Edges::TOP,
+            padding_left = 1,
+        ) {
+            p(color = Color::DarkGrey) {
+                (move || if done.get() { "✓ stream complete" } else { "… streaming" })
+            }
+            p(color = Color::DarkGrey) {
+                (move || if follow.get() { "[F] following" } else { "[F] follow off" })
+            }
+            p(color = Color::DarkGrey) { "↑/↓ scroll  [Q] quit" }
+        }
+    }
+}
+
+// ----- top-level app --------------------------------------------------------
+
+#[component]
+fn App() -> View {
     let content = create_signal(String::new());
     let offset = create_signal(0i32);
     let follow = create_signal(true);
     let done = create_signal(false);
     let theme = MarkdownTheme::default();
 
-    let (init_cols, init_rows) = term_size().unwrap_or((80, 24));
-    let term_cols = create_signal(init_cols);
-    let term_rows = create_signal(init_rows);
+    let (init_cols, init_rows) =
+        crossterm::terminal::size().unwrap_or((80, 24));
+    let term_cols = create_signal(init_cols as usize);
+    let term_rows = create_signal(init_rows as usize);
 
     use_future(async move {
         let chars: Vec<char> = SAMPLE_MD.chars().collect();
@@ -132,15 +172,15 @@ fn app() -> View {
     // Incremental parser held outside the memo so its committed-prefix cache
     // survives every rebuild; each tick re-parses only the open tail.
     let parser = std::rc::Rc::new(std::cell::RefCell::new(StreamingParser::new()));
-    let surface = create_memo(move || {
-        let width = (term_cols.get() as i32).saturating_sub(4).max(1) as usize;
-        parser
-            .borrow_mut()
-            .feed_to_surface(&content.get_clone(), width, &theme)
+    let blocks = create_memo({
+        let parser = std::rc::Rc::clone(&parser);
+        move || parser.borrow_mut().feed(&content.get_clone())
     });
-    let total_lines = create_memo(move || surface.get_clone().rows.len() as i32);
+    let total_height = create_memo(move || {
+        blocks_height(&blocks.get_clone(), term_cols.get() as usize, &theme) as i32
+    });
     let max_offset =
-        create_memo(move || total_lines.get().saturating_sub(visible_rows.get()).max(0));
+        create_memo(move || total_height.get().saturating_sub(visible_rows.get()).max(0));
     let top_offset = create_memo(move || {
         if follow.get() {
             max_offset.get()
@@ -163,8 +203,8 @@ fn app() -> View {
             tabindex = "0",
             on:terminal_resize = move |event: Event| {
                 if let Some((cols, rows)) = event.resize() {
-                    term_cols.set(cols);
-                    term_rows.set(rows);
+                    term_cols.set(cols as usize);
+                    term_rows.set(rows as usize);
                 }
             },
             on:raw_key = move |event: Event| {
@@ -188,41 +228,18 @@ fn app() -> View {
                 }
             },
         ) {
-            div(
-                flex_grow = 1.0_f32,
-                overflow = Overflow::Hidden,
-                border_style = BorderStyle::Single,
-                border_color = Color::DarkGrey,
-            ) {
+            Viewport(top_offset = top_offset) {
                 (move || {
-                    View::from_node(TuiNode::create_leaf_node(
-                        Box::new(surface.get_clone()),
-                        top_offset.get(),
-                    ))
+                    let theme = MarkdownTheme::default();
+                    iodilos_md::blocks_to_view(&blocks.get_clone(), &theme)
                 })
             }
-            div(
-                flex_direction = FlexDirection::Row,
-                column_gap = 2,
-                height = 1,
-                border_style = BorderStyle::Single,
-                border_color = Color::DarkGrey,
-                border_edges = Edges::TOP,
-                padding_left = 1,
-            ) {
-                p(color = Color::DarkGrey) {
-                    (move || if done.get_clone() { "✓ stream complete" } else { "… streaming" })
-                }
-                p(color = Color::DarkGrey) {
-                    (move || if follow.get() { "[F] following" } else { "[F] follow off" })
-                }
-                p(color = Color::DarkGrey) { "↑/↓ scroll  [Q] quit" }
-            }
+            StatusLine(done = *done, follow = *follow)
         }
     }
 }
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> std::io::Result<()> {
-    iodilos::render_async(app).await
+    iodilos::render_async(App).await
 }

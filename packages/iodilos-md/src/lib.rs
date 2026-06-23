@@ -13,6 +13,7 @@ pub mod parser;
 pub mod render;
 pub mod stream;
 pub mod theme;
+pub mod view;
 mod wrap;
 
 pub use highlight::Highlighter;
@@ -20,6 +21,7 @@ pub use parser::{Block, Inline, List, ListItem, Table, parse, parse_with_theme};
 pub use render::{render_blocks_to_surface, render_to_surface};
 pub use stream::StreamingParser;
 pub use theme::MarkdownTheme;
+pub use view::{blocks_height, blocks_to_view};
 
 use iodilos::producer::Lines;
 use iodilos::view::View;
@@ -29,11 +31,19 @@ pub fn markdown_surface(src: &str, width: usize, theme: &MarkdownTheme) -> Lines
     render_to_surface(src, width, theme)
 }
 
-/// Render Markdown into a `TextSurface` view (scroll 0) using the default theme.
-/// The caller wraps this in an `overflow: hidden` div and drives the surface's
-/// offset for scrolling.
+/// Render Markdown into a `Lines` producer view (scroll 0) using the default
+/// theme. Legacy pre-wrapped path; prefer [`markdown_view`] for new code.
 pub fn markdown(src: &str, width: usize) -> View {
     View::leaf(Box::new(markdown_surface(src, width, &MarkdownTheme::default())))
+}
+
+/// Render Markdown source into a **View tree** (framework primitives: `Spans`
+/// leaves for text, `div(border_style)` + `border_title` for code/math frames).
+/// Text re-wraps at the layout width for free on resize — no width guessing.
+pub fn markdown_view(src: &str) -> View {
+    let theme = MarkdownTheme::default();
+    let blocks = parse_with_theme(src, &theme);
+    blocks_to_view(&blocks, &theme)
 }
 
 #[cfg(test)]

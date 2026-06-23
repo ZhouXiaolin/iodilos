@@ -1,6 +1,27 @@
 use iodilos::prelude::*;
 
-fn app() -> View {
+/// Centered "card" component: rounded border, padded interior, takes any
+/// children.
+#[component(inline_props)]
+fn Card(children: Children<View>) -> View {
+    let children = children.call();
+    view! {
+        div(
+            border_style = BorderStyle::Round,
+            border_color = Color::Blue,
+            margin_bottom = 2,
+            padding_top = 2,
+            padding_bottom = 2,
+            padding_left = 8,
+            padding_right = 8,
+        ) {
+            (children)
+        }
+    }
+}
+
+#[component]
+fn App() -> View {
     view! {
         div(
             width = Size::Percent(100.0),
@@ -12,15 +33,7 @@ fn app() -> View {
             align_items = AlignItems::CENTER,
             justify_content = JustifyContent::CENTER,
         ) {
-            div(
-                border_style = BorderStyle::Round,
-                border_color = Color::Blue,
-                margin_bottom = 2,
-                padding_top = 2,
-                padding_bottom = 2,
-                padding_left = 8,
-                padding_right = 8,
-            ) {
+            Card {
                 p { "Current Time: static sycamore-tui port" }
             }
             p { "Press q to quit." }
@@ -29,5 +42,5 @@ fn app() -> View {
 }
 
 fn main() -> std::io::Result<()> {
-    render(app)
+    render(App)
 }

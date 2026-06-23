@@ -133,7 +133,7 @@ fn render_paragraph(
 
 /// Convert parsed `Inline`s into styled `TextSegment`s (one segment per run; inline code
 /// and math get their own themed style).
-fn inline_runs(
+pub(crate) fn inline_runs(
     inlines: &[Inline],
     theme: &MarkdownTheme,
     blockquote_depth: usize,
@@ -306,7 +306,7 @@ fn render_list(
     }
 }
 
-fn item_marker(idx: usize, item: &ListItem, ordered: bool, theme: &MarkdownTheme) -> (String, SpanStyle) {
+pub(crate) fn item_marker(idx: usize, item: &ListItem, ordered: bool, theme: &MarkdownTheme) -> (String, SpanStyle) {
     let (text, color) = if let Some(checked) = item.checked {
         (
             if checked {
@@ -785,8 +785,29 @@ fn pad_cell(content: &str, width: usize, align: pulldown_cmark::Alignment) -> St
     }
 }
 
-fn display_width(s: &str) -> usize {
+pub(crate) fn display_width(s: &str) -> usize {
     UnicodeWidthStr::width(s)
+}
+
+/// Render a single table into its styled-run rows at natural column widths
+/// (no shrinking to a target width). Used by the View-tree renderer, which
+/// hands the rows to a `Lines` leaf and lets `overflow: hidden` clip if the
+/// terminal is narrower than the natural table.
+pub(crate) fn table_rows(table: &Table, theme: &MarkdownTheme) -> Vec<Vec<(String, SpanStyle)>> {
+    let mut out = Vec::new();
+    // A very large width disables `fit_column_widths` shrinking (natural widths).
+    render_table(table, usize::MAX, theme, &mut out);
+    out
+}
+
+/// Render frontmatter key/value pairs into styled-run rows.
+pub(crate) fn frontmatter_rows(
+    pairs: &[(String, String)],
+    theme: &MarkdownTheme,
+) -> Vec<Vec<(String, SpanStyle)>> {
+    let mut out = Vec::new();
+    render_frontmatter(pairs, usize::MAX, theme, &mut out);
+    out
 }
 
 #[cfg(test)]

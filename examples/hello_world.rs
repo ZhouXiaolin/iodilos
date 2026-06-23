@@ -1,6 +1,7 @@
 use iodilos::prelude::*;
 
-fn app() -> View {
+#[component]
+fn App() -> View {
     view! {
         div(border_style = BorderStyle::Round, border_color = Color::Blue) {
             p { "Hello, world!" }
@@ -9,5 +10,5 @@ fn app() -> View {
 }
 
 fn main() -> std::io::Result<()> {
-    render(app)
+    render(App)
 }

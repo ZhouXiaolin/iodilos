@@ -9,6 +9,7 @@
 use crate::text::{Modifier, SpanStyle};
 use bitflags::bitflags;
 use crossterm::style::Color;
+use std::borrow::Cow;
 // `MaybeDyn` must be in scope: `impl_into_maybe_dyn!` references the unqualified
 // type name in its expansion. Both are re-exported at the crate root (the macro
 // via `#[macro_export]`, the type via `pub use reactive::*`).
@@ -381,6 +382,11 @@ impl BorderStyle {
     }
 }
 
+/// Styled runs for a [`Style::border_title`] — a legend painted on the top
+/// border. Each run is `(text, style)`; runs flow left-to-right after the
+/// top-left corner.
+pub type BorderTitleRuns = Vec<(Cow<'static, str>, SpanStyle)>;
+
 /// The author-facing flat style surface. Each field is one named style
 /// property. All fields accept `MaybeDyn` at the attribute layer; this struct
 /// holds the statically-resolved value used by layout and paint.
@@ -471,6 +477,12 @@ pub struct Style {
     pub border_color: Option<Color>,
     /// `border_edges` (defaults to all edges).
     pub border_edges: Option<Edges>,
+    /// Styled runs painted on the top border — a legend/title, like HTML
+    /// `<fieldset><legend>`. Each run keeps its own [`SpanStyle`]; runs start
+    /// right after the top-left corner and the rest of the top edge fills with
+    /// the border's `top` glyph. Only drawn with a non-`None` [`BorderStyle`]
+    /// whose top edge is present.
+    pub border_title: Option<BorderTitleRuns>,
     /// `background_color`.
     pub background_color: Option<Color>,
 

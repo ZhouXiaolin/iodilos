@@ -1,5 +1,11 @@
+//! A skinned numeric calculator, fully decomposed into components.
+//!
+//! Run with: `cargo run --example calculator`.
+
 use crossterm::event::{KeyCode, KeyEventKind};
 use iodilos::prelude::*;
+
+// ----- theme + styles -------------------------------------------------------
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 enum Theme {
@@ -44,19 +50,11 @@ impl Theme {
         }
     }
 
-    fn screen_color(self) -> Color {
-        Color::AnsiValue(68)
-    }
+    fn screen_color(self) -> Color { Color::AnsiValue(68) }
+    fn screen_text_color(self) -> Color { Color::AnsiValue(231) }
+    fn screen_trim_color(self) -> Color { Color::AnsiValue(75) }
 
-    fn screen_text_color(self) -> Color {
-        Color::AnsiValue(231)
-    }
-
-    fn screen_trim_color(self) -> Color {
-        Color::AnsiValue(75)
-    }
-
-    fn numpad_button_style(self) -> ButtonStyle {
+    fn numpad(self) -> ButtonStyle {
         match self {
             Self::Dark => ButtonStyle {
                 color: Color::AnsiValue(239),
@@ -71,7 +69,7 @@ impl Theme {
         }
     }
 
-    fn operator_button_style(self) -> ButtonStyle {
+    fn operator(self) -> ButtonStyle {
         ButtonStyle {
             color: Color::AnsiValue(172),
             text_color: Color::AnsiValue(231),
@@ -79,7 +77,7 @@ impl Theme {
         }
     }
 
-    fn clear_button_style(self) -> ButtonStyle {
+    fn clear(self) -> ButtonStyle {
         ButtonStyle {
             color: Color::AnsiValue(161),
             text_color: Color::AnsiValue(231),
@@ -87,7 +85,7 @@ impl Theme {
         }
     }
 
-    fn fn_button_style(self) -> ButtonStyle {
+    fn function(self) -> ButtonStyle {
         ButtonStyle {
             color: Color::AnsiValue(66),
             text_color: Color::AnsiValue(231),
@@ -95,6 +93,8 @@ impl Theme {
         }
     }
 }
+
+// ----- action model ---------------------------------------------------------
 
 #[derive(Clone, Copy)]
 struct CalculatorActions {
@@ -176,27 +176,14 @@ impl CalculatorActions {
     }
 
     fn key(self, event: Event) {
-        let Some(key) = event.key() else {
-            return;
-        };
-        if key.kind == KeyEventKind::Release {
-            return;
-        }
+        let Some(key) = event.key() else { return; };
+        if key.kind == KeyEventKind::Release { return; }
         match key.code {
             KeyCode::Char('/') => self.operator('÷'),
             KeyCode::Char('*') => self.operator('×'),
             KeyCode::Char('+') => self.operator('+'),
             KeyCode::Char('-') => self.operator('-'),
-            KeyCode::Char('0') => self.number(0),
-            KeyCode::Char('1') => self.number(1),
-            KeyCode::Char('2') => self.number(2),
-            KeyCode::Char('3') => self.number(3),
-            KeyCode::Char('4') => self.number(4),
-            KeyCode::Char('5') => self.number(5),
-            KeyCode::Char('6') => self.number(6),
-            KeyCode::Char('7') => self.number(7),
-            KeyCode::Char('8') => self.number(8),
-            KeyCode::Char('9') => self.number(9),
+            KeyCode::Char(c @ '0'..='9') => self.number((c as u8) - b'0'),
             KeyCode::Char('.') => self.decimal(),
             KeyCode::Char('%') => self.percent(),
             KeyCode::Char('=') | KeyCode::Enter => self.equals(),
@@ -208,10 +195,7 @@ impl CalculatorActions {
 }
 
 fn has_trailing_operator(expr: &str) -> bool {
-    matches!(
-        expr.chars().last(),
-        Some('+') | Some('-') | Some('×') | Some('÷')
-    )
+    matches!(expr.chars().last(), Some('+' | '-' | '×' | '÷'))
 }
 
 fn current_number_has_decimal(expr: &str) -> bool {
@@ -220,7 +204,11 @@ fn current_number_has_decimal(expr: &str) -> bool {
         .is_some_and(|n| n.contains('.'))
 }
 
-fn screen(content: ReadSignal<String>, theme: ReadSignal<Theme>) -> View {
+// ----- view components ------------------------------------------------------
+
+/// The expression display at the top of the calculator.
+#[component(inline_props)]
+fn Screen(content: ReadSignal<String>, theme: ReadSignal<Theme>) -> View {
     view! {
         div(
             width = Size::Percent(100.0),
@@ -240,14 +228,16 @@ fn screen(content: ReadSignal<String>, theme: ReadSignal<Theme>) -> View {
     }
 }
 
-fn calc_button(
+/// One skinned key. `on_click` runs when the button fires.
+#[component(inline_props)]
+fn Key(
     label: &'static str,
     style: ButtonStyle,
     on_click: impl FnMut(Event) + 'static,
 ) -> View {
     view! {
         button(
-            on:click=on_click,
+            on:click = on_click,
             flex_grow = 1.0_f32,
             margin_left = 1,
             margin_right = 1,
@@ -270,31 +260,46 @@ fn calc_button(
     }
 }
 
-fn button_row(a: View, b: View, c: View, d: View) -> View {
+/// One row of four `Key`s — its children are populated by the caller.
+#[component(inline_props)]
+fn KeyRow(children: Children<View>) -> View {
+    let children = children.call();
     view! {
         div(flex_direction = FlexDirection::Row, width = Size::Percent(100.0)) {
-            (a)
-            (b)
-            (c)
-            (d)
+            (children)
         }
     }
 }
 
-fn calculator(theme: ReadSignal<Theme>) -> View {
+/// The bottom statusline.
+#[component(inline_props)]
+fn Footer(theme: ReadSignal<Theme>) -> View {
+    view! {
+        div(
+            height = 1,
+            background_color = move || theme.get().footer_background_color(),
+            padding_left = 1,
+        ) {
+            p(color = move || theme.get().footer_text_color()) { "[T] Toggle Theme [Q] Quit" }
+        }
+    }
+}
+
+/// The 4×5 button pad + screen, parameterised by the current theme.
+#[component(inline_props)]
+fn Calculator(theme: ReadSignal<Theme>) -> View {
     let expr = create_signal(String::from("0"));
     let clear_on_number = create_signal(true);
-    let actions = CalculatorActions {
-        expr,
-        clear_on_number,
-    };
+    let actions = CalculatorActions { expr, clear_on_number };
     let content = create_memo(move || expr.get_clone());
 
-    let current_theme = theme.get();
-    let numpad = current_theme.numpad_button_style();
-    let operator = current_theme.operator_button_style();
-    let function = current_theme.fn_button_style();
-    let clear = current_theme.clear_button_style();
+    // Style buckets recomputed on each rebuild — flipping the theme rebuilds
+    // the calculator subtree, which is cheap (no scope churn for inner keys).
+    let current = theme.get();
+    let numpad = current.numpad();
+    let op = current.operator();
+    let func = current.function();
+    let clr = current.clear();
 
     view! {
         div(
@@ -303,46 +308,50 @@ fn calculator(theme: ReadSignal<Theme>) -> View {
             flex_direction = FlexDirection::Column,
             padding_left = 1,
             padding_right = 1,
-            on:raw_key=move |event: Event| actions.key(event),
+            on:raw_key = move |event: Event| actions.key(event),
         ) {
             div(padding_left = 1, padding_right = 1) {
-                (screen(content, theme))
+                Screen(content = content, theme = theme)
             }
-            (button_row(
-                calc_button("←", function, move |_| actions.backspace()),
-                calc_button("±", function, move |_| actions.plus_minus()),
-                calc_button("%", function, move |_| actions.percent()),
-                calc_button("÷", operator, move |_| actions.operator('÷')),
-            ))
-            (button_row(
-                calc_button("7", numpad, move |_| actions.number(7)),
-                calc_button("8", numpad, move |_| actions.number(8)),
-                calc_button("9", numpad, move |_| actions.number(9)),
-                calc_button("×", operator, move |_| actions.operator('×')),
-            ))
-            (button_row(
-                calc_button("4", numpad, move |_| actions.number(4)),
-                calc_button("5", numpad, move |_| actions.number(5)),
-                calc_button("6", numpad, move |_| actions.number(6)),
-                calc_button("-", operator, move |_| actions.operator('-')),
-            ))
-            (button_row(
-                calc_button("1", numpad, move |_| actions.number(1)),
-                calc_button("2", numpad, move |_| actions.number(2)),
-                calc_button("3", numpad, move |_| actions.number(3)),
-                calc_button("+", operator, move |_| actions.operator('+')),
-            ))
-            (button_row(
-                calc_button("C", clear, move |_| actions.clear()),
-                calc_button("0", numpad, move |_| actions.number(0)),
-                calc_button(".", numpad, move |_| actions.decimal()),
-                calc_button("=", operator, move |_| actions.equals()),
-            ))
+
+            KeyRow {
+                Key(label = "←", style = func, on_click = move |_| actions.backspace())
+                Key(label = "±", style = func, on_click = move |_| actions.plus_minus())
+                Key(label = "%", style = func, on_click = move |_| actions.percent())
+                Key(label = "÷", style = op,   on_click = move |_| actions.operator('÷'))
+            }
+            KeyRow {
+                Key(label = "7", style = numpad, on_click = move |_| actions.number(7))
+                Key(label = "8", style = numpad, on_click = move |_| actions.number(8))
+                Key(label = "9", style = numpad, on_click = move |_| actions.number(9))
+                Key(label = "×", style = op,     on_click = move |_| actions.operator('×'))
+            }
+            KeyRow {
+                Key(label = "4", style = numpad, on_click = move |_| actions.number(4))
+                Key(label = "5", style = numpad, on_click = move |_| actions.number(5))
+                Key(label = "6", style = numpad, on_click = move |_| actions.number(6))
+                Key(label = "-", style = op,     on_click = move |_| actions.operator('-'))
+            }
+            KeyRow {
+                Key(label = "1", style = numpad, on_click = move |_| actions.number(1))
+                Key(label = "2", style = numpad, on_click = move |_| actions.number(2))
+                Key(label = "3", style = numpad, on_click = move |_| actions.number(3))
+                Key(label = "+", style = op,     on_click = move |_| actions.operator('+'))
+            }
+            KeyRow {
+                Key(label = "C", style = clr,    on_click = move |_| actions.clear())
+                Key(label = "0", style = numpad, on_click = move |_| actions.number(0))
+                Key(label = ".", style = numpad, on_click = move |_| actions.decimal())
+                Key(label = "=", style = op,     on_click = move |_| actions.equals())
+            }
         }
     }
 }
 
-fn app() -> View {
+// ----- top-level app --------------------------------------------------------
+
+#[component]
+fn App() -> View {
     let theme = create_signal(Theme::default());
 
     view! {
@@ -352,7 +361,7 @@ fn app() -> View {
             background_color = move || theme.get().background_color(),
             flex_direction = FlexDirection::Column,
             gap = 1,
-            on:raw_key=move |event: Event| {
+            on:raw_key = move |event: Event| {
                 if let Some(key) = event.key()
                     && key.kind != KeyEventKind::Release
                     && matches!(key.code, KeyCode::Char('t'))
@@ -364,20 +373,16 @@ fn app() -> View {
         ) {
             div(flex_grow = 1.0_f32) {
                 div(max_width = 120, max_height = 40, flex_grow = 1.0_f32) {
-                    (move || calculator(*theme))
+                    // The calculator subtree rebuilds when the theme flips —
+                    // a thin dynamic region so the inner button styles refresh.
+                    (move || view! { Calculator(theme = *theme) })
                 }
             }
-            div(
-                height = 1,
-                background_color = move || theme.get().footer_background_color(),
-                padding_left = 1,
-            ) {
-                p(color = move || theme.get().footer_text_color()) { "[T] Toggle Theme [Q] Quit" }
-            }
+            Footer(theme = *theme)
         }
     }
 }
 
 fn main() -> std::io::Result<()> {
-    render(app)
+    render(App)
 }

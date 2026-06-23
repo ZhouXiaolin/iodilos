@@ -3,10 +3,11 @@ use iodilos::prelude::*;
 #[derive(Clone, Copy)]
 struct NumberOfTheDay(i32);
 
-fn app() -> View {
-    provide_context(NumberOfTheDay(42));
+/// Reads the contextual value and renders the announcement. Splitting it out
+/// keeps `App` focused on context wiring.
+#[component]
+fn Announcement() -> View {
     let number = use_context::<NumberOfTheDay>();
-
     view! {
         div(border_style = BorderStyle::Round, border_color = Color::Cyan) {
             p {
@@ -18,6 +19,15 @@ fn app() -> View {
     }
 }
 
+#[component]
+fn App() -> View {
+    provide_context(NumberOfTheDay(42));
+
+    view! {
+        Announcement()
+    }
+}
+
 fn main() -> std::io::Result<()> {
-    render(app)
+    render(App)
 }

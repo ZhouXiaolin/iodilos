@@ -129,6 +129,7 @@ impl_into_style_dyn_for_value!(crate::style::FlexBasis, i32, crate::style::Perce
 impl_into_style_dyn_for_value!(crate::style::BorderStyle);
 impl_into_style_dyn_for_value!(crate::style::Weight);
 impl_into_style_dyn_for_value!(crate::style::Edges);
+impl_into_style_dyn_for_value!(crate::style::BorderTitleRuns);
 // Re-exported external enums take only their own type.
 impl_into_style_dyn_for_value!(taffy::style::Display);
 impl_into_style_dyn_for_value!(taffy::style::FlexDirection);
@@ -434,6 +435,19 @@ pub trait GlobalAttributesExt: GlobalAttributes {
         (border_color, crossterm::style::Color, border_color);
         (color, crossterm::style::Color, color);
         (underline_color, crossterm::style::Color, underline_color);
+    }
+
+    /// Set the `border_title` style property: styled runs painted on the top
+    /// border (a legend). `Vec` is not `Copy`, so this is a hand-written method
+    /// rather than a `style_methods_optional!` entry. Accepts a static value or
+    /// any reactive source (signal / closure) via [`IntoStyleDyn`].
+    fn border_title(
+        self,
+        value: impl IntoStyleDyn<crate::style::BorderTitleRuns>,
+    ) -> Self {
+        self.style_prop("border_title", value, |v, s| {
+            s.border_title = Some(v.clone())
+        })
     }
 }
 /// A spreadable attribute bag.

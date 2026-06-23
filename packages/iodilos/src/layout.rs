@@ -417,6 +417,7 @@ fn paint_node(
                 node.rect,
                 border_chars,
                 node.style.border_edges,
+                node.style.border_title.as_deref(),
                 border_style,
                 clip,
             );
@@ -498,6 +499,7 @@ fn paint_border_clipped(
     rect: Rect,
     chars: crate::style::BorderCharacters,
     edges: Option<Edges>,
+    title: Option<&[(Cow<'static, str>, SpanStyle)]>,
     style: SpanStyle,
     clip: Rect,
 ) {
@@ -524,13 +526,8 @@ fn paint_border_clipped(
             .width
             .saturating_sub(left_border_size)
             .saturating_sub(right_border_size);
-        paint_text_clipped_raw(
-            fb,
-            Rect::new(rect.x + (left_border_size as i32), rect.y, width, 1),
-            &chars.top.to_string().repeat(width as usize),
-            style,
-            clip,
-        );
+        let top_x = rect.x + (left_border_size as i32);
+        paint_top_edge(fb, top_x, rect.y, width, title, chars.top, style, clip);
         if edges.contains(Edges::RIGHT) {
             paint_text_clipped_raw(
                 fb,
@@ -593,6 +590,59 @@ fn paint_border_clipped(
                 clip,
             );
         }
+    }
+}
+
+/// Paint the top edge of a border at `(x, y)`, spanning `width` cells. If
+/// `title` is present, its styled runs are painted left-to-right (clipped, no
+/// wrapping — wide glyphs included) starting at `x`, and the remaining cells
+/// fill with the border's `top` glyph. Without a title the whole edge is the
+/// `top` glyph.
+fn paint_top_edge(
+    fb: &mut Framebuffer,
+    x: i32,
+    y: i32,
+    width: u16,
+    title: Option<&[(Cow<'static, str>, SpanStyle)]>,
+    fill_char: char,
+    fill_style: SpanStyle,
+    clip: Rect,
+) {
+    let max_col = width as usize;
+    let mut col = 0usize;
+    if let Some(runs) = title {
+        'outer: for (run, run_style) in runs {
+            for ch in run.chars() {
+                if ch == '\n' {
+                    continue;
+                }
+                let cw = unicode_width::UnicodeWidthChar::width(ch)
+                    .unwrap_or(0)
+                    .max(1);
+                if col + cw > max_col {
+                    break 'outer;
+                }
+                let cx = x + col as i32;
+                if clip.contains(cx, y) {
+                    fb.set_text(
+                        Rect::new(cx, y, cw as u16, 1),
+                        &ch.to_string(),
+                        *run_style,
+                    );
+                }
+                col += cw;
+            }
+        }
+    }
+    if col < max_col {
+        let fill = fill_char.to_string().repeat(max_col - col);
+        paint_text_clipped_raw(
+            fb,
+            Rect::new(x + col as i32, y, (max_col - col) as u16, 1),
+            &fill,
+            fill_style,
+            clip,
+        );
     }
 }
 
@@ -840,6 +890,7 @@ mod tests {
                 ..Default::default()
             },
             Some(Edges::TOP),
+            None,
             SpanStyle::default(),
             Rect::new(0, 0, 6, 2).into(),
         );
@@ -849,6 +900,78 @@ mod tests {
             painted.starts_with("▁▁▁▁▁▁"),
             "top-only border should fill both ends: {painted}"
         );
+    }
+
+    #[test]
+    fn border_title_splices_runs_into_top_edge() {
+        use crate::style::{BorderStyle, BorderTitleRuns};
+        use std::borrow::Cow;
+        let mut nodes = Vec::new();
+        let root = create_root(|| {
+            let title: BorderTitleRuns = vec![
+                (" ".to_string().into(), SpanStyle::default()),
+                (Cow::Borrowed("hi"), SpanStyle::default()),
+                (" ".to_string().into(), SpanStyle::default()),
+            ];
+            let view: View = tags::div()
+                .width(12)
+                .height(3)
+                .border_style(BorderStyle::Round)
+                .border_title(title)
+                .into();
+            nodes = view.nodes.into_iter().collect();
+        });
+        let (fb, _index) = render(&nodes, Rect::new(0, 0, 12, 3), None);
+        let painted = canvas_to_plain_text(&fb);
+        root.dispose();
+
+        let top: Vec<char> = painted.lines().next().unwrap().chars().collect();
+        assert_eq!(
+            &top[..5],
+            &['╭', ' ', 'h', 'i', ' '],
+            "title runs splice after the corner: {:?}",
+            top.iter().collect::<String>()
+        );
+        assert_eq!(*top.last().unwrap(), '╮', "top-right corner draws");
+        // The cells between the title and the right corner are `─` fill.
+        let fill = &top[5..top.len() - 1];
+        assert!(
+            fill.iter().all(|&c| c == '─'),
+            "remainder should be border fill: {:?}",
+            fill.iter().collect::<String>()
+        );
+    }
+
+    #[test]
+    fn border_title_clips_when_runs_exceed_width() {
+        use crate::style::{BorderStyle, BorderTitleRuns};
+        use std::borrow::Cow;
+        let mut nodes = Vec::new();
+        let root = create_root(|| {
+            let title: BorderTitleRuns =
+                vec![(Cow::Borrowed("a very long title that overflows"), SpanStyle::default())];
+            let view: View = tags::div()
+                .width(10)
+                .height(3)
+                .border_style(BorderStyle::Round)
+                .border_title(title)
+                .into();
+            nodes = view.nodes.into_iter().collect();
+        });
+        let (fb, _index) = render(&nodes, Rect::new(0, 0, 10, 3), None);
+        let painted = canvas_to_plain_text(&fb);
+        root.dispose();
+
+        let top: Vec<char> = painted.lines().next().unwrap().chars().collect();
+        // 10 wide: corner(1) + 8 edge cells + corner(1). Title clips to 8 chars.
+        assert_eq!(
+            top.len(),
+            10,
+            "top row should be exactly the border width: {:?}",
+            top.iter().collect::<String>()
+        );
+        assert_eq!(top[0], '╭', "corner intact");
+        assert_eq!(*top.last().unwrap(), '╮', "right corner intact");
     }
 
     #[test]

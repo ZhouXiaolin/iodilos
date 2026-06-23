@@ -35,7 +35,9 @@
 
 use crate::parser::{Block, parse};
 use crate::render::{inlines_to_string, render_blocks_to_surface};
+use crate::view::blocks_to_view;
 use iodilos::producer::Lines;
+use iodilos::view::View;
 use crate::theme::MarkdownTheme;
 
 /// A stateful, append-only streaming Markdown parser.
@@ -155,6 +157,17 @@ impl StreamingParser {
     ) -> Lines {
         let blocks = self.feed(src);
         render_blocks_to_surface(&blocks, width, theme)
+    }
+
+    /// Feed the full current source and render the resulting blocks into a
+    /// **View tree** (composed from framework primitives: `Spans` leaves for
+    /// text, `div(border_style)` for code/math frames, `border_title` for
+    /// labels). The committed prefix is parsed incrementally; only the open
+    /// tail is re-parsed each call. Prefer this over [`feed_to_surface`] for
+    /// new code: text re-wraps at the layout width for free on resize.
+    pub fn feed_to_view(&mut self, src: &str, theme: &MarkdownTheme) -> View {
+        let blocks = self.feed(src);
+        blocks_to_view(&blocks, theme)
     }
 
     /// The byte length of the committed (cached) prefix. Exposed for tests.

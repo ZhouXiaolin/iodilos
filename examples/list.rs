@@ -29,8 +29,21 @@ fn Row(props: RowProps) -> View {
     }
 }
 
-fn app() -> View {
-    let mut count = create_signal(0i32);
+/// The +/- toolbar over the list.
+#[component(inline_props)]
+fn Controls(count: Signal<i32>) -> View {
+    let mut count = count;
+    view! {
+        div(flex_direction = FlexDirection::Row, gap = 1) {
+            button(on:click = move |_| count -= 1) { "-" }
+            button(on:click = move |_| count += 1) { "+" }
+        }
+    }
+}
+
+#[component]
+fn App() -> View {
+    let count = create_signal(0i32);
     // Derive `[1, 2, ..., count]` reactively from the counter. `items` is a
     // `ReadSignal<Vec<i32>>`, which `Keyed` accepts as its `list`.
     let items = create_memo(move || (1..=count.get()).collect::<Vec<i32>>());
@@ -44,10 +57,7 @@ fn app() -> View {
         ) {
             p(color = Color::Cyan) { "Items: " (count) }
 
-            div(flex_direction = FlexDirection::Row, gap = 1) {
-                button(on:click = move |_| count -= 1) { "-" }
-                button(on:click = move |_| count += 1) { "+" }
-            }
+            Controls(count = count)
 
             // Keyed iteration: each value is its own key. On a counter change,
             // only items whose value actually changed re-run the `view`
@@ -70,5 +80,5 @@ fn app() -> View {
 }
 
 fn main() -> std::io::Result<()> {
-    render(app)
+    render(App)
 }

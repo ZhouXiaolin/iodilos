@@ -12,8 +12,22 @@ fn Heading(title: &'static str) -> View {
     }
 }
 
-fn app() -> View {
-    let mut count = create_signal(0i32);
+/// The +/- / Reset button row.
+#[component(inline_props)]
+fn Controls(count: Signal<i32>) -> View {
+    let mut count = count;
+    view! {
+        div(flex_direction = FlexDirection::Row, gap = 1) {
+            button(on:click = move |_| count -= 1)        { "-" }
+            button(on:click = move |_| count += 1)        { "+" }
+            button(on:click = move |_| count.set(0))      { "Reset" }
+        }
+    }
+}
+
+#[component]
+fn App() -> View {
+    let count = create_signal(0i32);
 
     view! {
         // The panel: a column with a 1-cell gap and 1-cell padding, drawn with a
@@ -28,12 +42,7 @@ fn app() -> View {
 
             p(color = Color::Cyan) { "Value: " (count) }
 
-            // The button row: laid out left-to-right with a 1-cell gap.
-            div(flex_direction = FlexDirection::Row, gap = 1) {
-                button(on:click = move |_| count -= 1) { "-" }
-                button(on:click = move |_| count += 1) { "+" }
-                button(on:click = move |_| count.set(0)) { "Reset" }
-            }
+            Controls(count = count)
 
             // `Show` renders its children only while `when` is true. The
             // condition is reactive, so the hint appears/disappears as the
@@ -46,5 +55,5 @@ fn app() -> View {
 }
 
 fn main() -> std::io::Result<()> {
-    render(app)
+    render(App)
 }

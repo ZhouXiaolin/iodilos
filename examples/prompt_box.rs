@@ -1,7 +1,9 @@
-//! Statusline + framed multiline prompt box demo.
+//! Statusline + framed multiline prompt box demo (component edition).
 //!
-//! Renders a rounded box: the statusline sits on the top border, the framed
-//! multiline input below it, and a self-drawn block cursor marks the caret.
+//! The prompt is the [`PromptBox`] component — it owns its editing model and
+//! keyboard handling, renders a rounded frame with the statusline on the top
+//! border, and a `Spans` input leaf that re-wraps on resize. This example just
+//! docks it at the bottom of the screen and echoes submitted lines above it.
 //!
 //! Keys:
 //!   - printable char   -> insert at cursor
@@ -15,77 +17,42 @@
 //! Real Shift+Enter requires a kitty-keyboard-protocol terminal (kitty,
 //! WezTerm, Ghostty, foot, Alacritty ≥0.15, …); on others use Alt+Enter.
 
-use std::cell::RefCell;
-use std::rc::Rc;
-
-use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
-use crossterm::terminal::size as term_size;
-use iodilos::node::TuiNode;
 use iodilos::prelude::*;
-use iodilos_prompt::{PromptModel, PromptTheme, StatusLine, render_prompt_to_surface};
+use iodilos_prompt::PromptBox;
 
-fn app() -> View {
-    let model = Rc::new(RefCell::new(PromptModel::new()));
-    // Revision counter: bumped on every edit so the surface memo re-renders.
-    let rev = create_signal(0u32);
-    let statusline = StatusLine::default_mock();
-    let theme = PromptTheme::default();
-
-    let (init_cols, _init_rows) = term_size().unwrap_or((80, 24));
-    let term_cols = create_signal(init_cols as usize);
-
-    let surface = create_memo({
-        let model = Rc::clone(&model);
-        let statusline = statusline.clone();
-        move || {
-            rev.get(); // depend on edits
-            let m = model.borrow();
-            render_prompt_to_surface(m.buffer(), m.cursor_char(), &statusline, term_cols.get(), &theme)
+/// The scrolling transcript above the prompt: one grey paragraph per submitted
+/// line, newest at the bottom.
+#[component(inline_props)]
+fn Transcript(history: Signal<Vec<String>>) -> View {
+    view! {
+        div(flex_grow = 1.0_f32, overflow = Overflow::Hidden, padding_left = 1) {
+            Keyed(
+                list = history,
+                view = |line| view! { p(color = Color::Grey) { (line) } },
+                key = |line| line.clone(),
+            )
         }
-    });
+    }
+}
+
+#[component]
+fn App() -> View {
+    let history = create_signal(Vec::<String>::new());
 
     view! {
         div(
             flex_direction = FlexDirection::Column,
             width = Size::Percent(100.0),
             height = Size::Percent(100.0),
-            tabindex = "0",
-            on:terminal_resize = move |event: Event| {
-                if let Some((cols, _rows)) = event.resize() {
-                    term_cols.set(cols as usize);
-                }
-            },
-            on:raw_key = move |event: Event| {
-                let Some(key) = event.key() else { return; };
-                if key.kind == KeyEventKind::Release {
-                    return;
-                }
-                {
-                    let mut m = model.borrow_mut();
-                    match key.code {
-                        KeyCode::Enter => {
-                            if key.modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) {
-                                m.newline();
-                            } else {
-                                m.submit();
-                            }
-                        }
-                        KeyCode::Backspace => m.backspace(),
-                        KeyCode::Left => m.move_left(),
-                        KeyCode::Right => m.move_right(),
-                        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            m.insert_char(c);
-                        }
-                        _ => {}
-                    }
-                } // mutable borrow released before rev.set
-                rev.set(rev.get() + 1);
-            },
         ) {
-            div(flex_grow = 1.0_f32) {}
-            (move || {
-                rev.get(); // depend on edits
-                View::from_node(TuiNode::create_leaf_node(Box::new(surface.get_clone()), 0))
+            Transcript(history = history)
+
+            // The prompt, docked at the bottom. It owns its own editing state
+            // and keyboard handling; on submit it appends to `history`.
+            PromptBox(on_submit = move |text: &str| {
+                if !text.is_empty() {
+                    history.update(|h| h.push(text.to_string()));
+                }
             })
         }
     }
@@ -93,7 +60,7 @@ fn app() -> View {
 
 fn main() -> std::io::Result<()> {
     iodilos::render_with(
-        app,
+        App,
         RenderConfig {
             keyboard_enhancement: true,
             quit: QuitPolicy::CtrlCOnly,

@@ -50,6 +50,7 @@ pub use components::table_view::{
     CellContext, CellFactory, TableRow, TableSection, TableViewProps, table_view,
 };
 pub use events::{Event, EventKind};
+pub use producer::Spans;
 pub use node::{AsTuiNode, NodeId, TuiNode};
 pub use noderef::NodeRef;
 pub use reactive::*;
@@ -75,7 +76,7 @@ pub use taffy::style::{
 
 /// The normal import surface for TUI applications.
 pub mod prelude {
-    pub use crate::component::{Component, Props};
+    pub use crate::component::{Children, Component, Props};
     pub use crate::reactive::*;
     pub use crossterm::style::Color;
     pub use iodilos_macros::{Props, component, view};
@@ -109,7 +110,7 @@ pub mod prelude {
         BorderCharacters, BorderStyle, Edges, FlexBasis, Gap, Inset, Margin, Padding, Percent,
         Size, Style, Weight,
     };
-    pub use crate::producer::{CellProducer, Plain};
+    pub use crate::producer::{CellProducer, Lines, Plain, Spans};
     pub use crate::text::{Modifier, SpanStyle};
     pub use crate::view::{View, ViewNode, ViewTuiNode};
     pub use crate::{bind, events};

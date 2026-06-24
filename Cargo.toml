@@ -30,4 +30,6 @@ ureq = { version = "2.12.1", features = ["json"] }
 iodilos-md = { path = "packages/iodilos-md" }
 # example-specific deps (prompt_box): the in-tree prompt component lib.
 iodilos-prompt = { path = "packages/iodilos-prompt" }
+# example-specific deps (jsonl_replay): JSONL parsing for session replay.
+serde_json = "1.0"
 

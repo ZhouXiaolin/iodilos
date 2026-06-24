@@ -1,8 +1,16 @@
-use std::rc::Rc;
+//! Completion menu — a single-section [`Tabled`] specialised for completion
+//! candidates.
+//!
+//! Selection is keyed by the item's `label` (`ReadSignal<Option<String>>`):
+//! when candidates are inserted/removed, the highlight stays glued to its label
+//! rather than drifting with a flat index. Internally it routes through
+//! [`Tabled`] with a single `title: None` section, so no header is ever drawn —
+//! the `FlatRow::Header` branch is statically `unreachable!()`.
 
 use crate::prelude::*;
-use crate::{CellContext, CellFactory, TableRow, TableSection, TableViewProps, table_view};
 
+/// One completion candidate. `label` doubles as the selection key, so labels
+/// must be unique within a menu.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CompletionItem {
     pub label: String,
@@ -21,71 +29,77 @@ impl CompletionItem {
 #[derive(Clone)]
 pub struct CompletionMenuProps {
     pub items: ReadSignal<Vec<CompletionItem>>,
-    pub selected: ReadSignal<usize>,
+    /// Currently highlighted candidate by label. `None` = no highlight.
+    pub selected: ReadSignal<Option<String>>,
     pub max_visible: usize,
     pub border_color: Color,
 }
 
 pub fn completion_menu(props: CompletionMenuProps) -> View {
     let items = props.items;
-    let items_for_visibility = items;
-    let sections = create_memo(move || {
-        vec![TableSection {
-            title: None,
-            rows: items
-                .get_clone()
-                .into_iter()
-                .map(|item| {
-                    TableRow::new(item.label.clone(), item.label).with_description(item.description)
-                })
-                .collect(),
-        }]
-    });
+    let selected = props.selected;
 
-    let cell_factory: CellFactory = Rc::new(|ctx: &CellContext| {
-        let marker = if ctx.selected { "▶ " } else { "  " };
-        let fg = if ctx.selected {
-            Color::Black
-        } else {
-            Color::Grey
-        };
-        let description = ctx.description.clone().unwrap_or_default();
-        let row = tags::div()
-            .flex_direction(FlexDirection::Row)
-            .width(Size::Percent(100.0))
-            .column_gap(2);
-        let row = if ctx.selected {
-            row.background_color(Color::Yellow)
-        } else {
-            row
-        };
+    // A single untitled section: no header row is emitted, so the
+    // `FlatRow::Header` arm in the view closure is unreachable. We wrap the
+    // items in a memo so `Tabled` sees a `ReadSignal<Vec<TableSection<_>>>`.
+    let sections = create_memo(move || vec![TableSection::new(items.get_clone())]);
 
-        View::from(
-            row.children((
-                tags::p()
-                    .color(fg)
-                    .children(format!("{marker}{}", ctx.label)),
-                tags::p().color(Color::DarkGrey).children(description),
-            )),
-        )
-    });
-
+    // Empty list → the whole popup disappears (border included), matching the
+    // §7 contract: a completion menu with nothing to show renders nothing.
     View::from_dynamic(move || {
-        if items_for_visibility.get_clone().is_empty() {
+        if items.get_clone().is_empty() {
             return View::new();
         }
-        View::from(
-            tags::div()
-                .border_style(BorderStyle::Round)
-                .border_color(props.border_color)
-                .padding_left(1)
-                .padding_right(1)
-                .children(table_view(TableViewProps {
-                    sections,
-                    selected: props.selected,
-                    max_visible: props.max_visible,
-                    cell_factory: Rc::clone(&cell_factory),
-                })),
-        )
+        let max_visible = props.max_visible;
+        let border_color = props.border_color;
+        view! {
+            div(
+                border_style = BorderStyle::Round,
+                border_color = border_color,
+                padding_left = 1,
+                padding_right = 1,
+            ) {
+                Tabled(
+                    sections = sections,
+                    selected = selected,
+                    max_visible = max_visible,
+                    key = |item: &CompletionItem| item.label.clone(),
+                    view = |row: FlatRow<CompletionItem, String>| match row {
+                        FlatRow::Header { .. } => {
+                            unreachable!("completion_menu never renders a header")
+                        }
+                        FlatRow::Body { item, is_selected, .. } => {
+                            let label = item.label.clone();
+                            let description = item.description.clone();
+                            view! {
+                                div(
+                                    flex_direction = FlexDirection::Row,
+                                    width = Size::Percent(100.0),
+                                    column_gap = 2,
+                                    background_color = move || if is_selected.get() {
+                                        Color::Yellow
+                                    } else {
+                                        Color::Reset
+                                    },
+                                ) {
+                                    p(color = move || if is_selected.get() {
+                                        Color::Black
+                                    } else {
+                                        Color::Grey
+                                    }) {
+                                        (move || if is_selected.get() {
+                                            format!("▶ {label}")
+                                        } else {
+                                            format!("  {label}")
+                                        })
+                                    }
+                                    p(color = Color::DarkGrey) { (description) }
+                                }
+                            }
+                        }
+                    },
+                )
+            }
+        }
     })
 }

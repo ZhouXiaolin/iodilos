@@ -636,6 +636,7 @@ dependencies = [
  "iodilos-prompt",
  "mexprp",
  "serde",
+ "serde_json",
  "tokio",
  "ureq",
 ]
@@ -667,6 +668,7 @@ name = "iodilos-prompt"
 version = "0.1.0"
 dependencies = [
  "crossterm",
+ "futures-timer",
  "iodilos",
  "unicode-width",
 ]

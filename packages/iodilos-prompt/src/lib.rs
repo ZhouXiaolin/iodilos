@@ -13,6 +13,6 @@ pub mod theme;
 
 pub use component::{PromptBox, PromptBoxProps, PromptSubmit};
 pub use model::PromptModel;
-pub use render::{input_runs, statusline_runs};
+pub use render::{PromptView, input_runs, statusline_runs};
 pub use statusline::{StatusField, StatusLine};
 pub use theme::PromptTheme;

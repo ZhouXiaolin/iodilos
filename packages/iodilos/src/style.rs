@@ -503,6 +503,29 @@ pub struct Style {
     pub crossed_out: bool,
     /// `underline_color`.
     pub underline_color: Option<Color>,
+
+    // --- scroll (paint-time content shift) ---
+    /// `scroll`: terminal rows to shift this element's content up by at paint
+    /// time. Unlike taffy `overflow`, which only clips, `scroll` actively
+    /// translates the child subtree (and the producer rows of descendant
+    /// leaves) upward, hiding the top `scroll` rows inside the element's own
+    /// rect.
+    ///
+    /// Three regimes:
+    /// - `scroll == 0` (default): no shift; the top of the content is visible.
+    /// - `scroll > 0`: hide that many rows from the **top** of the content
+    ///   ("absolute position from the top"). `i32::MAX` means "stick to
+    ///   bottom" — the paint path clamps to `[0, content_height − viewport]`.
+    /// - `scroll < 0`: hide `|scroll|` rows from the **bottom** of the content
+    ///   ("scrolled up by N rows from stick-to-bottom"). Resolves to
+    ///   `max_scroll + scroll` and clamps to `[0, max_scroll]`, so an over-shoot
+    ///   simply lands at the top of the content.
+    ///
+    /// This is the element-level analogue of a leaf's `scroll` offset, lifted
+    /// out of the node constructor and into the style surface so any element —
+    /// a `StreamingList`, a bordered viewport, a custom container — can scroll
+    /// its children uniformly.
+    pub scroll: i32,
 }
 
 impl Style {

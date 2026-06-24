@@ -5,7 +5,8 @@ use iodilos::Color;
 /// Colour scheme for the prompt box.
 #[derive(Debug, Clone, Copy)]
 pub struct PromptTheme {
-    /// Border/frame glyphs (`╭ │ ╰ ─ ╮ ╯`) and the top-border dash filler.
+    /// Frame glyphs (`╭ │ ╰ ─ ╮ ╯`), drawn by `PromptView` as the prompt's
+    /// rounded border.
     pub frame: Color,
     /// Dim elements: the ` > ` separators and the leading space before the tail.
     pub separator: Color,

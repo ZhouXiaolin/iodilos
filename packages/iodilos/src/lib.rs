@@ -43,12 +43,8 @@ pub use components::custom_element;
 pub use components::iter::{Indexed, IndexedProps, Keyed, KeyedProps};
 pub use components::show::{Show, ShowProps};
 pub use components::overlay_box::{OverlayBoxProps, OverlayGeometry, overlay_box};
-pub use components::scroll_view::{
-    ScrollContent, ScrollViewProps, ScrollWindow, centered_window, scroll_view,
-};
-pub use components::table_view::{
-    CellContext, CellFactory, TableRow, TableSection, TableViewProps, table_view,
-};
+pub use components::streaming_list::{StreamingList, StreamingListProps};
+pub use components::tabled::{FlatRow, TableSection, Tabled, TabledProps};
 pub use events::{Event, EventKind};
 pub use producer::Spans;
 pub use node::{AsTuiNode, NodeId, TuiNode};
@@ -92,12 +88,8 @@ pub mod prelude {
     pub use crate::components::iter::{Indexed, IndexedProps, Keyed, KeyedProps};
     pub use crate::components::overlay_box::{OverlayBoxProps, OverlayGeometry, overlay_box};
     pub use crate::components::show::{Show, ShowProps};
-    pub use crate::components::scroll_view::{
-        ScrollContent, ScrollViewProps, ScrollWindow, centered_window, scroll_view,
-    };
-    pub use crate::components::table_view::{
-        CellContext, CellFactory, TableRow, TableSection, TableViewProps, table_view,
-    };
+    pub use crate::components::streaming_list::{StreamingList, StreamingListProps};
+    pub use crate::components::tabled::{FlatRow, TableSection, Tabled, TabledProps};
     pub use crate::components::tags;
     pub use crate::events::{Event, EventKind};
     pub use crate::node::{NodeId, TuiNode};
@@ -110,7 +102,7 @@ pub mod prelude {
         BorderCharacters, BorderStyle, Edges, FlexBasis, Gap, Inset, Margin, Padding, Percent,
         Size, Style, Weight,
     };
-    pub use crate::producer::{CellProducer, Lines, Plain, Spans};
+    pub use crate::producer::{row, CellProducer, Lines, Plain, Spans};
     pub use crate::text::{Modifier, SpanStyle};
     pub use crate::view::{View, ViewNode, ViewTuiNode};
     pub use crate::{bind, events};

@@ -16,9 +16,9 @@ use crate::view::{View, ViewTuiNode};
 pub mod completion_menu;
 pub mod iter;
 pub mod overlay_box;
-pub mod scroll_view;
 pub mod show;
-pub mod table_view;
+pub mod streaming_list;
+pub mod tabled;
 
 /// Construct a node for the given static tag string.
 fn element(tag: &'static str) -> TuiNode {

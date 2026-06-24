@@ -14,3 +14,5 @@ path = "src/lib.rs"
 iodilos = { path = "../iodilos" }
 crossterm = "0.29"
 unicode-width = "0.2"
+# Drives the cursor blink timer.
+futures-timer = "3.0"

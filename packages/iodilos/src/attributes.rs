@@ -144,6 +144,7 @@ impl_into_style_dyn_for_value!(taffy::style::AlignContent);
 impl_into_style_dyn_for_value!(crossterm::style::Color);
 impl_into_style_dyn_for_value!(f32);
 impl_into_style_dyn_for_value!(bool);
+impl_into_style_dyn_for_value!(i32);
 
 /// A possibly dynamic string attribute.
 pub type StringAttribute = MaybeDyn<Option<Cow<'static, str>>>;
@@ -423,6 +424,7 @@ pub trait GlobalAttributesExt: GlobalAttributes {
         (invert, bool, invert);
         (dim, bool, dim);
         (crossed_out, bool, crossed_out);
+        (scroll, i32, scroll);
     }
 
     style_methods_optional! {

@@ -41,6 +41,89 @@ pub trait CellProducer {
     }
 }
 
+/// Reusable, wide-glyph-correct row-construction primitives.
+///
+/// The cell invariant every shaped row obeys: **each [`Cell`] is exactly one
+/// terminal column**, and a wide glyph (CJK, emoji — display width 2) is stored
+/// as a `[glyph cell, blanked trailing cell]` pair (the trailing cell is
+/// `Cell::default()`, `glyph: None`). The framebuffer writer relies on this: it
+/// advances two columns past a wide glyph and skips emitting the blanked cell.
+///
+/// Custom producers that build rows by hand (borders, statuslines, prompt
+/// frames) must honour this invariant — in particular they must **never
+/// re-add** a trailing blank cell that an upstream shaper (`Spans`, `Lines`)
+/// already added, or CJK text renders with a spurious space between every
+/// glyph. Use these helpers instead of re-deriving the rule.
+pub mod row {
+    use super::*;
+
+    /// Build a single-column glyph cell. For a width-1 frame/border character
+    /// this is the whole cell; for content, prefer [`push_glyph`] (which adds
+    /// the trailing blank for wide glyphs).
+    pub fn glyph_cell(ch: char, style: SpanStyle) -> Cell {
+        Cell {
+            background: None,
+            glyph: Some(Glyph {
+                value: ch.to_string(),
+                style,
+            }),
+        }
+    }
+
+    /// The display width of a cell: 1 for a normal glyph or a blanked trailing
+    /// cell, or the glyph's full width for a wide glyph. Use this when
+    /// budgeting columns — it is the authoritative answer.
+    pub fn cell_width(cell: &Cell) -> usize {
+        cell.glyph.as_ref().map(|g| g.width()).unwrap_or(1)
+    }
+
+    /// Push one glyph into `buf` plus its trailing blank cell when the glyph is
+    /// wide. This is the canonical "one glyph → N cells" primitive; every cell
+    /// added advances the column count by exactly the glyph's display width.
+    pub fn push_glyph(buf: &mut Vec<Cell>, ch: char, style: SpanStyle) {
+        let cw = ch.width().unwrap_or(0).max(1);
+        buf.push(glyph_cell(ch, style));
+        if cw > 1 {
+            buf.push(Cell::default());
+        }
+    }
+
+    /// Pad `row` with empty cells up to `width`. Used to make every shaped row
+    /// a uniform `width` cells.
+    pub fn pad(row: &mut Vec<Cell>, width: usize) {
+        while row.len() < width {
+            row.push(Cell::default());
+        }
+    }
+
+    /// Pad `row` with copies of `fill` up to `width`. Use for borders where the
+    /// fill glyph (e.g. `─`) must carry a style.
+    pub fn pad_with(row: &mut Vec<Cell>, width: usize, fill: Cell) {
+        while row.len() < width {
+            row.push(fill.clone());
+        }
+    }
+
+    /// Copy column-indexed cells from `src` onto the end of `dst`, stopping at
+    /// `max` total columns. Wide-glyph safe: `src` is assumed to already carry
+    /// its trailing blank cells (as `Spans`/`Lines` produce), so each source
+    /// cell advances the column count by exactly 1 and no trailing blank is
+    /// re-added. A wide glyph that would straddle the `max` boundary is dropped
+    /// (a half-wide glyph at the row edge would mis-render).
+    pub fn extend_clamped(dst: &mut Vec<Cell>, src: &[Cell], max: usize) {
+        for cell in src {
+            if dst.len() >= max {
+                break;
+            }
+            let cw = cell_width(cell);
+            if cw > 1 && dst.len() + cw > max {
+                break;
+            }
+            dst.push(cell.clone());
+        }
+    }
+}
+
 /// A single-style plain-text producer: the common case for `From<&str>`,
 /// numeric leaves, and dynamic strings. Characters wrap at `width` (character
 /// wrapping, matching the previous surface char-wrap). Each glyph keeps its
@@ -276,18 +359,9 @@ fn shape_plain(text: &str, style: SpanStyle, width: usize) -> Vec<Vec<Cell>> {
         if current.len() + cw > width && !current.is_empty() {
             rows.push(pad_to_width(std::mem::take(&mut current), width));
         }
-        current.push(Cell {
-            background: None,
-            glyph: Some(Glyph {
-                value: ch.to_string(),
-                style,
-            }),
-        });
-        // Blank the wide glyph's trailing cell so the terminal advances two
-        // columns without emitting an extra space.
-        if cw > 1 {
-            current.push(Cell::default());
-        }
+        // push_glyph blanks the wide glyph's trailing cell so the terminal
+        // advances two columns without emitting an extra space.
+        row::push_glyph(&mut current, ch, style);
     }
     rows.push(pad_to_width(current, width));
     rows
@@ -312,16 +386,7 @@ fn shape_spans(runs: &[(String, SpanStyle)], width: usize) -> Vec<Vec<Cell>> {
             if current.len() + cw > width && !current.is_empty() {
                 rows.push(pad_to_width(std::mem::take(&mut current), width));
             }
-            current.push(Cell {
-                background: None,
-                glyph: Some(Glyph {
-                    value: ch.to_string(),
-                    style: *style,
-                }),
-            });
-            if cw > 1 {
-                current.push(Cell::default());
-            }
+            row::push_glyph(&mut current, ch, *style);
         }
     }
     rows.push(pad_to_width(current, width));
@@ -414,18 +479,9 @@ fn drain_token(
 }
 
 /// Push one glyph cell (plus a blank trailing cell for wide glyphs) into `buf`.
+/// Thin wrapper over the public [`row::push_glyph`] primitive.
 fn push_cell(buf: &mut Vec<Cell>, ch: char, style: SpanStyle) {
-    buf.push(Cell {
-        background: None,
-        glyph: Some(Glyph {
-            value: ch.to_string(),
-            style,
-        }),
-    });
-    let cw = ch.width().unwrap_or(0).max(1);
-    if cw > 1 {
-        buf.push(Cell::default());
-    }
+    row::push_glyph(buf, ch, style);
 }
 
 /// Shape one row of styled runs into exactly `width` cells, clipping overflow
@@ -440,28 +496,19 @@ fn shape_runs(runs: &[(String, SpanStyle)], width: usize) -> Vec<Cell> {
             let cw = ch.width().unwrap_or(0).max(1);
             if row.len() + cw > width {
                 // Clip the rest of the row; padding to width happens below.
-                return pad_to_width(row, width);
+                row::pad(&mut row, width);
+                return row;
             }
-            row.push(Cell {
-                background: None,
-                glyph: Some(Glyph {
-                    value: ch.to_string(),
-                    style: *style,
-                }),
-            });
-            if cw > 1 {
-                row.push(Cell::default());
-            }
+            row::push_glyph(&mut row, ch, *style);
         }
     }
-    pad_to_width(row, width)
+    row::pad(&mut row, width);
+    row
 }
 
 /// Pad a partial row up to `width` with empty cells so every row is uniform.
 fn pad_to_width(mut row: Vec<Cell>, width: usize) -> Vec<Cell> {
-    while row.len() < width {
-        row.push(Cell::default());
-    }
+    row::pad(&mut row, width);
     row
 }
 
@@ -509,6 +556,55 @@ mod tests {
         assert_eq!(rows[0][0].glyph.as_ref().unwrap().value, "好");
         assert!(rows[0][1].glyph.is_none(), "trailing cell blanked");
         assert_eq!(rows[0][2].glyph.as_ref().unwrap().value, "X");
+    }
+
+    #[test]
+    fn plain_consecutive_wide_glyphs_have_no_space_between() {
+        // 你好 — both CJK, width 2 each. Must be 4 cells total with NO space
+        // (no spurious blank, no double-counted trailing cell).
+        let p = Plain::new("你好");
+        let rows = p.render(10);
+        assert_eq!(rows[0].len(), 10, "padded to width");
+        let glyphs: Vec<&str> = rows[0]
+            .iter()
+            .filter_map(|c| c.glyph.as_ref().map(|g| g.value.as_str()))
+            .collect();
+        assert_eq!(glyphs, vec!["你", "好"], "two glyphs, no gap glyph");
+        // Column 0,1 = 你 (glyph + blank), 2,3 = 好 (glyph + blank).
+        assert_eq!(rows[0][0].glyph.as_ref().unwrap().value, "你");
+        assert!(rows[0][1].glyph.is_none(), "你 trailing blank");
+        assert_eq!(rows[0][2].glyph.as_ref().unwrap().value, "好");
+        assert!(rows[0][3].glyph.is_none(), "好 trailing blank");
+    }
+
+    #[test]
+    fn row_primitives_are_wide_glyph_safe() {
+        use super::row;
+        let style = SpanStyle::default();
+
+        // push_glyph adds exactly one trailing blank for a wide glyph.
+        let mut buf = Vec::new();
+        row::push_glyph(&mut buf, '你', style);
+        row::push_glyph(&mut buf, '好', style);
+        assert_eq!(buf.len(), 4, "two wide glyphs = 4 cells");
+        assert_eq!(buf[0].glyph.as_ref().unwrap().value, "你");
+        assert!(buf[1].glyph.is_none());
+        assert_eq!(buf[2].glyph.as_ref().unwrap().value, "好");
+        assert!(buf[3].glyph.is_none());
+
+        // extend_clamped copies column-indexed cells verbatim — it must NOT
+        // re-add trailing cells. Build a producer-shaped source (glyph+blank
+        // pairs) and clamp into a row that already has a prefix.
+        let src: Vec<Cell> = buf.clone();
+        let mut dst = vec![row::glyph_cell('│', style)];
+        row::extend_clamped(&mut dst, &src, 5); // prefix(1) + 4 content = 5
+        assert_eq!(
+            dst.len(),
+            5,
+            "no double-counted blanks: prefix + 4 source cells"
+        );
+        assert_eq!(dst[1].glyph.as_ref().unwrap().value, "你");
+        assert_eq!(dst[3].glyph.as_ref().unwrap().value, "好");
     }
 
     #[test]

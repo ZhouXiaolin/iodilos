@@ -479,6 +479,49 @@ fn paint_node(
     } else {
         clip.intersect(content_rect(node)).unwrap_or_default()
     };
+
+    // Element scroll: shift the child subtree up by `scroll` rows at paint time.
+    // This is the element-level analogue of a leaf's scroll offset. The paint
+    // path already clips children to `child_clip` (the element's content box),
+    // so a translated child whose rect now sits above the box is simply not
+    // drawn — exactly the "hide the top N rows" semantics. A large `scroll`
+    // (e.g. `i32::MAX`) means "stick to bottom"; the clamp below limits it to
+    // the content height that actually overflows the element's own rect, so the
+    // last `visible_height` rows land inside the clip without the caller knowing
+    // the viewport height. Leaf descendants read their own (translated) rect to
+    // pick the visible window, so nested leaves scroll correctly too.
+    //
+    // Negative `scroll` means "from the bottom, N rows up" — what a typical
+    // "scrollback by lines" UI needs (you only know how many lines you've
+    // scrolled up since stick-to-bottom, not the absolute position from the
+    // top). It is resolved to `max_scroll + scroll` (i.e. `max_scroll - |N|`)
+    // and then clamped to `[0, max_scroll]`, so going further up than the very
+    // top still lands at the top instead of underflowing.
+    let scroll = if node.style.scroll != 0 {
+        // `content_rect` height is the element's visible (allocated) height.
+        // `total` is the sum of children's natural heights along the block axis;
+        // we approximate it with the bottom of the last child relative to this
+        // node's top, which is exact for the common column-flex list case.
+        let visible_height = content_rect(node).height as i32;
+        let content_bottom = node
+            .children
+            .iter()
+            .map(|c| c.rect.bottom() - node.rect.y)
+            .max()
+            .unwrap_or(0);
+        let max_scroll = (content_bottom - visible_height).max(0);
+        if node.style.scroll < 0 {
+            // From-bottom offset: resolve to absolute and clamp to [0, max].
+            max_scroll
+                .saturating_add(node.style.scroll)
+                .clamp(0, max_scroll)
+        } else {
+            node.style.scroll.min(max_scroll)
+        }
+    } else {
+        0
+    };
+
     // Sort children by z-index so higher values paint on top (painter's algorithm).
     let mut sorted: Vec<&PaintNode> = node.children.iter().collect();
     sorted.sort_by_key(|child| child.style.z_index);
@@ -490,7 +533,36 @@ fn paint_node(
         } else {
             child_clip
         };
-        paint_node(fb, child, text, bounds, screen);
+        if scroll > 0 {
+            // Translate the child (and, by recursion, its whole subtree) up by
+            // `scroll` rows. We mutate a local copy of the child's rect and
+            // recurse through a shim so the original PaintNode is untouched.
+            let mut shifted = clone_with_offset(child, 0, -scroll);
+            paint_node(fb, &mut shifted, text, bounds, screen);
+        } else {
+            paint_node(fb, child, text, bounds, screen);
+        }
+    }
+}
+
+/// Recursively clone a `PaintNode` subtree with every rect's `y` offset by
+/// `dy` (and `x` by `dx`). Used by element scroll to translate the child
+/// subtree at paint time without mutating the taffy-computed `PaintNode` tree.
+///
+/// Producers (leaf content) are `Rc`-shared, so cloning a leaf is cheap — it
+/// shares the producer, only the rect moves. The leaf's own `scroll` offset is
+/// preserved; element scroll and leaf scroll compose (element shifts the leaf's
+/// position, the leaf's scroll then hides rows within its translated window).
+fn clone_with_offset(node: &PaintNode, dx: i32, dy: i32) -> PaintNode {
+    PaintNode {
+        rect: Rect::new(node.rect.x + dx, node.rect.y + dy, node.rect.width, node.rect.height),
+        style: node.style.clone(),
+        children: node
+            .children
+            .iter()
+            .map(|c| clone_with_offset(c, dx, dy))
+            .collect(),
+        producer: node.producer.clone(),
     }
 }
 
@@ -1706,6 +1778,181 @@ mod tests {
             border_col,
             Some(10),
             "1/8 horizontal inset should put the left border at col 10, got row 3: {border_line:?}"
+        );
+        root.dispose();
+    }
+
+    /// A container with `scroll` shifts its child subtree up: the first child
+    /// scrolls out of view, later children scroll in. Verifies the core
+    /// element-scroll mechanism (child translation + clip).
+    #[test]
+    fn element_scroll_shifts_children_up() {
+        let mut nodes = Vec::new();
+        let root = create_root(|| {
+            // 8 children labelled L0..L7, each one row. Viewport height 3.
+            let children: Vec<View> = (0..8)
+                .map(|i| {
+                    View::from(tags::div().children(tags::p().children(format!("L{i}"))))
+                })
+                .collect();
+            let view: View = tags::div()
+                .width(20)
+                .height(3)
+                .overflow(taffy::style::Overflow::Hidden)
+                .scroll(3)
+                .children(children)
+                .into();
+            nodes = view.nodes.into_iter().collect();
+        });
+        let (fb, _index) = render(&nodes, Rect::new(0, 0, 20, 3), None);
+        let painted = canvas_to_plain_text(&fb);
+        // scroll=3 hides L0,L1,L2 → visible rows should be L3,L4,L5.
+        let visible: Vec<&str> = painted.lines().take(3).collect();
+        assert!(
+            !painted.contains("L0") && !painted.contains("L1") && !painted.contains("L2"),
+            "scrolled-out rows should be hidden; got:\n{painted}"
+        );
+        assert!(
+            visible[0].contains("L3"),
+            "scroll=3 should show L3 at top; got row0={:?}",
+            visible[0]
+        );
+        root.dispose();
+    }
+
+    /// `i32::MAX` scroll clamps to stick-to-bottom: only the last viewport
+    /// rows are visible.
+    #[test]
+    fn element_scroll_max_sticks_to_bottom() {
+        let mut nodes = Vec::new();
+        let root = create_root(|| {
+            let children: Vec<View> = (0..8)
+                .map(|i| {
+                    View::from(tags::div().children(tags::p().children(format!("L{i}"))))
+                })
+                .collect();
+            let view: View = tags::div()
+                .width(20)
+                .height(3)
+                .overflow(taffy::style::Overflow::Hidden)
+                .scroll(i32::MAX)
+                .children(children)
+                .into();
+            nodes = view.nodes.into_iter().collect();
+        });
+        let (fb, _index) = render(&nodes, Rect::new(0, 0, 20, 3), None);
+        let painted = canvas_to_plain_text(&fb);
+        // stick-to-bottom with viewport 3 → L5,L6,L7 visible.
+        let rows: Vec<&str> = painted.lines().take(3).collect();
+        assert!(
+            rows[0].contains("L5"),
+            "stick-to-bottom should show L5 first; got row0={:?}",
+            rows[0]
+        );
+        assert!(
+            rows[2].contains("L7"),
+            "last visible row should be L7; got row2={:?}",
+            rows[2]
+        );
+        root.dispose();
+    }
+
+    /// scroll=0 (the default) shows the top of the content unchanged.
+    #[test]
+    fn element_scroll_zero_shows_top() {
+        let mut nodes = Vec::new();
+        let root = create_root(|| {
+            let children: Vec<View> = (0..8)
+                .map(|i| {
+                    View::from(tags::div().children(tags::p().children(format!("L{i}"))))
+                })
+                .collect();
+            let view: View = tags::div()
+                .width(20)
+                .height(3)
+                .overflow(taffy::style::Overflow::Hidden)
+                .children(children)
+                .into();
+            nodes = view.nodes.into_iter().collect();
+        });
+        let (fb, _index) = render(&nodes, Rect::new(0, 0, 20, 3), None);
+        let painted = canvas_to_plain_text(&fb);
+        let rows: Vec<&str> = painted.lines().take(3).collect();
+        assert!(rows[0].contains("L0"), "scroll=0 shows L0; got {:?}", rows[0]);
+        assert!(rows[2].contains("L2"), "scroll=0 shows L2; got {:?}", rows[2]);
+        root.dispose();
+    }
+
+    /// Negative `scroll` offsets the visible window upward from
+    /// stick-to-bottom: -2 with 8 children and viewport 3 → L3,L4,L5 visible
+    /// (stick-to-bottom would show L5,L6,L7; -2 hides the bottom two rows by
+    /// scrolling the content's view up two lines).
+    #[test]
+    fn element_scroll_negative_offsets_from_bottom() {
+        let mut nodes = Vec::new();
+        let root = create_root(|| {
+            let children: Vec<View> = (0..8)
+                .map(|i| {
+                    View::from(tags::div().children(tags::p().children(format!("L{i}"))))
+                })
+                .collect();
+            let view: View = tags::div()
+                .width(20)
+                .height(3)
+                .overflow(taffy::style::Overflow::Hidden)
+                .scroll(-2)
+                .children(children)
+                .into();
+            nodes = view.nodes.into_iter().collect();
+        });
+        let (fb, _index) = render(&nodes, Rect::new(0, 0, 20, 3), None);
+        let painted = canvas_to_plain_text(&fb);
+        let rows: Vec<&str> = painted.lines().take(3).collect();
+        assert!(
+            rows[0].contains("L3"),
+            "scroll=-2 should show L3 at top; got row0={:?}",
+            rows[0]
+        );
+        assert!(
+            rows[2].contains("L5"),
+            "scroll=-2 should show L5 at bottom; got row2={:?}",
+            rows[2]
+        );
+        root.dispose();
+    }
+
+    /// A negative `scroll` larger than the available scrollback clamps at the
+    /// top (it does NOT underflow to a "scrolled past the start" empty view).
+    #[test]
+    fn element_scroll_negative_clamps_at_top() {
+        let mut nodes = Vec::new();
+        let root = create_root(|| {
+            let children: Vec<View> = (0..8)
+                .map(|i| {
+                    View::from(tags::div().children(tags::p().children(format!("L{i}"))))
+                })
+                .collect();
+            let view: View = tags::div()
+                .width(20)
+                .height(3)
+                .overflow(taffy::style::Overflow::Hidden)
+                .scroll(-100)
+                .children(children)
+                .into();
+            nodes = view.nodes.into_iter().collect();
+        });
+        let (fb, _index) = render(&nodes, Rect::new(0, 0, 20, 3), None);
+        let painted = canvas_to_plain_text(&fb);
+        let rows: Vec<&str> = painted.lines().take(3).collect();
+        assert!(
+            rows[0].contains("L0"),
+            "scroll=-large clamps to top, shows L0; got row0={:?}",
+            rows[0]
+        );
+        assert!(
+            rows[2].contains("L2"),
+            "scroll=-large clamps to top, shows L2; got row2={:?}",
+            rows[2]
         );
         root.dispose();
     }

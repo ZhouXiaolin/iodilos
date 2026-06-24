@@ -363,7 +363,21 @@ fn write_row_into(
         if ux >= dst.len() {
             continue;
         }
-        dst[ux] = cell.clone();
+        // A producer cell with `background: None` is transparent: it must not
+        // erase the bg that a parent `set_background_color` painted onto these
+        // cells. Producers explicitly set `Some(_)` when they want their own bg
+        // (e.g. an inline-code highlight); `Some(_)` overrides the existing bg
+        // exactly as before. Without this, a parent `div(background_color = ..)`
+        // wrapping a leaf would lose its highlight wherever the leaf's glyphs
+        // landed — the symptom is "selection bg shows through gaps but not
+        // under the text". The leaf's own `clear_text` already wiped stale
+        // glyphs ahead of this write, so merging here is safe.
+        if cell.background.is_some() {
+            dst[ux] = cell.clone();
+        } else {
+            // Preserve the existing bg; only update glyph.
+            dst[ux].glyph = cell.glyph.clone();
+        }
     }
 }
 
@@ -528,12 +542,23 @@ fn paint_node(
     for child in sorted {
         // An absolutely-positioned child lives in its containing block, not this
         // node's flex flow, so clip it to the screen rather than the parent.
-        let bounds = if child.style.position == taffy::style::Position::Absolute {
-            screen
-        } else {
-            child_clip
-        };
+        let is_absolute = child.style.position == taffy::style::Position::Absolute;
+        let bounds = if is_absolute { screen } else { child_clip };
         if scroll > 0 {
+            // Cull non-absolute children whose translated y-band falls entirely
+            // outside the viewport. The paint path would clip them anyway, but
+            // `clone_with_offset` recurses through the whole subtree before that
+            // clip ever applies — for a long `StreamingList` this is the dominant
+            // cost while scrolling. We skip culling absolute children: they are
+            // clipped to `screen`, not `child_clip`, so their visibility is
+            // decided elsewhere and the y-band test would be wrong.
+            if !is_absolute {
+                let shifted_top = child.rect.y - scroll;
+                let shifted_bottom = shifted_top + child.rect.height as i32;
+                if shifted_bottom <= child_clip.y || shifted_top >= child_clip.bottom() {
+                    continue;
+                }
+            }
             // Translate the child (and, by recursion, its whole subtree) up by
             // `scroll` rows. We mutate a local copy of the child's rect and
             // recurse through a shim so the original PaintNode is untouched.
@@ -1451,6 +1476,104 @@ mod tests {
         root.dispose();
     }
 
+    /// A leaf's `background: None` cells must NOT erase a bg the parent painted
+    /// via `set_background_color`. Producer cells are transparent by default;
+    /// only explicit `Some(_)` (e.g. inline-code highlight) overrides. Without
+    /// this, the `completion_menu` selection bg shows through gaps between
+    /// glyphs but is wiped wherever a glyph lands ("mcp变黑" / "选中色只在没文
+    /// 字的地方") — the symptom that motivated the fix.
+    #[test]
+    fn parent_background_survives_under_leaf_text() {
+        use crate::producer::Plain;
+        use crate::view::ViewTuiNode;
+        use crossterm::style::Color;
+        let mut nodes = Vec::new();
+        let root = crate::reactive::create_root(|| {
+            let producer: Box<dyn CellProducer> = Box::new(Plain::new("hi"));
+            let view: View = tags::div()
+                .width(5)
+                .height(1)
+                .background_color(Color::Yellow)
+                .children(View::from_node(TuiNode::create_leaf_node(producer, 0)))
+                .into();
+            nodes = view.nodes.into_iter().collect();
+        });
+        let (fb, _index) = render(&nodes, Rect::new(0, 0, 5, 1), None);
+        // The 'h' glyph at col 0 must keep the parent's yellow bg, AND the
+        // glyph itself must be present.
+        let under_h = fb.cell(0, 0).unwrap();
+        assert_eq!(
+            under_h.background,
+            Some(Color::Yellow),
+            "leaf glyph must not erase parent bg"
+        );
+        assert_eq!(
+            under_h.glyph.as_ref().map(|g| g.value.as_str()),
+            Some("h"),
+            "leaf glyph must still render: {under_h:?}"
+        );
+        // An empty cell beyond the text still carries the parent bg.
+        let trailing = fb.cell(3, 0).unwrap();
+        assert_eq!(
+            trailing.background,
+            Some(Color::Yellow),
+            "empty trailing cell keeps parent bg"
+        );
+        root.dispose();
+    }
+
+    /// A producer that explicitly sets `Cell.background = Some(_)` (e.g. a
+    /// future inline-code highlight that uses cell-level bg rather than the
+    /// glyph's `SpanStyle.bg`) must still override the parent's bg under its
+    /// own cells. Pins the "explicit Some overrides, None is transparent" rule.
+    #[test]
+    fn leaf_cell_background_overrides_parent_background() {
+        use crate::framebuffer::{Cell, Glyph};
+        use crate::view::ViewTuiNode;
+        use crate::producer::row::push_glyph;
+        use crossterm::style::Color;
+
+        struct OneRowOpaque;
+        impl CellProducer for OneRowOpaque {
+            fn measure(&self, _w: usize) -> usize { 1 }
+            fn render(&self, width: usize) -> Vec<Vec<Cell>> {
+                // Cells 0..3: opaque red bg. Cells 3..width: default (transparent).
+                let mut row = Vec::with_capacity(width);
+                for ch in "ABC".chars() {
+                    let mut cell = Cell::default();
+                    cell.background = Some(Color::Red);
+                    cell.glyph = Some(Glyph { value: ch.to_string(), style: SpanStyle::default() });
+                    let _ = push_glyph; // silence unused for non-wide path
+                    row.push(cell);
+                }
+                while row.len() < width {
+                    row.push(Cell::default());
+                }
+                vec![row]
+            }
+            fn intrinsic_width(&self) -> usize { 3 }
+        }
+
+        let mut nodes = Vec::new();
+        let root = crate::reactive::create_root(|| {
+            let producer: Box<dyn CellProducer> = Box::new(OneRowOpaque);
+            let view: View = tags::div()
+                .width(5)
+                .height(1)
+                .background_color(Color::Yellow)
+                .children(View::from_node(TuiNode::create_leaf_node(producer, 0)))
+                .into();
+            nodes = view.nodes.into_iter().collect();
+        });
+        let (fb, _index) = render(&nodes, Rect::new(0, 0, 5, 1), None);
+        // Cells 0..3 should be red (leaf override); cells 3..5 should remain yellow.
+        assert_eq!(fb.cell(0, 0).unwrap().background, Some(Color::Red));
+        assert_eq!(fb.cell(2, 0).unwrap().background, Some(Color::Red));
+        assert_eq!(fb.cell(3, 0).unwrap().background, Some(Color::Yellow));
+        assert_eq!(fb.cell(4, 0).unwrap().background, Some(Color::Yellow));
+        root.dispose();
+    }
+
     #[test]
     fn text_surface_paints_per_segment_styles() {
         use crate::producer::Lines;
@@ -1953,6 +2076,161 @@ mod tests {
             rows[2].contains("L2"),
             "scroll=-large clamps to top, shows L2; got row2={:?}",
             rows[2]
+        );
+        root.dispose();
+    }
+
+    /// Element-scroll viewport culling: children whose translated y-band falls
+    /// entirely outside the viewport must NOT have their producer's `render`
+    /// invoked. Without culling, every off-screen child still recurses through
+    /// `clone_with_offset` and `paint_node`, and the leaf's `render` is called
+    /// once per off-screen row's subtree — the dominant cost of scrolling a
+    /// long `StreamingList`. The clip-in-`paint_node` tail only suppresses the
+    /// writes; the shaping work has already happened. This test pins the
+    /// optimization in place.
+    #[test]
+    fn element_scroll_culls_offscreen_children_before_render() {
+        use std::cell::Cell as StdCell;
+        use std::rc::Rc;
+        use crate::framebuffer::Cell;
+        use crate::view::ViewTuiNode;
+
+        /// A producer that counts how many times its `render` was called.
+        struct Counting {
+            label: String,
+            calls: Rc<StdCell<u32>>,
+        }
+        impl CellProducer for Counting {
+            fn measure(&self, _width: usize) -> usize {
+                1
+            }
+            fn render(&self, width: usize) -> Vec<Vec<Cell>> {
+                self.calls.set(self.calls.get() + 1);
+                // Return one row of `width` blank cells — contents are irrelevant
+                // here; we only assert call counts.
+                vec![vec![Cell::default(); width]]
+            }
+            fn intrinsic_width(&self) -> usize {
+                self.label.chars().count()
+            }
+        }
+
+        // 20 children, each a 1-row leaf. Viewport height 3, scroll = 10 →
+        // children 10/11/12 visible; the other 17 must be culled before
+        // `render` is dispatched.
+        const N: usize = 20;
+        let counters: Vec<Rc<StdCell<u32>>> =
+            (0..N).map(|_| Rc::new(StdCell::new(0))).collect();
+        let mut nodes = Vec::new();
+        let root = create_root(|| {
+            let children: Vec<View> = (0..N)
+                .map(|i| {
+                    let producer: Box<dyn CellProducer> = Box::new(Counting {
+                        label: format!("L{i:02}"),
+                        calls: counters[i].clone(),
+                    });
+                    View::from_node(TuiNode::create_leaf_node(producer, 0))
+                })
+                .collect();
+            let view: View = tags::div()
+                .width(10)
+                .height(3)
+                .overflow(taffy::style::Overflow::Hidden)
+                .scroll(10)
+                .children(children)
+                .into();
+            nodes = view.nodes.into_iter().collect();
+        });
+        let _ = render(&nodes, Rect::new(0, 0, 10, 3), None);
+
+        // The three visible rows (indices 10, 11, 12) must have rendered. All
+        // others must have been culled before their producer was touched.
+        for (i, counter) in counters.iter().enumerate() {
+            let calls = counter.get();
+            if (10..=12).contains(&i) {
+                assert!(calls >= 1, "visible child L{i:02} should render, got {calls}");
+            } else {
+                assert_eq!(
+                    calls, 0,
+                    "off-screen child L{i:02} should be culled, got {calls} render calls"
+                );
+            }
+        }
+        root.dispose();
+    }
+
+    /// Bench (release-only, run with
+    ///   `cargo test --release -p iodilos -- --ignored --nocapture bench_streaming_scroll`).
+    /// Times one render() of a 1000-entry list with the viewport sat in the
+    /// middle. Each entry is a small subtree (`div > div > div > leaf`) so the
+    /// per-entry clone cost is non-trivial — matches the shape of a real
+    /// `StreamingList` of message blocks. Compare against the same bench with
+    /// element-scroll viewport culling disabled to size the optimization.
+    #[test]
+    #[ignore]
+    fn bench_streaming_scroll() {
+        use std::time::Instant;
+        use crate::framebuffer::Cell;
+        use crate::view::ViewTuiNode;
+
+        struct OneLine(&'static str);
+        impl CellProducer for OneLine {
+            fn measure(&self, _width: usize) -> usize { 1 }
+            fn render(&self, width: usize) -> Vec<Vec<Cell>> {
+                let _ = self.0;
+                vec![vec![Cell::default(); width]]
+            }
+            fn intrinsic_width(&self) -> usize { self.0.len() }
+        }
+
+        const N: usize = 1000;
+        const VIEWPORT_H: i32 = 30;
+        const W: i32 = 80;
+
+        let mut nodes = Vec::new();
+        let root = create_root(|| {
+            // Each entry is a card: outer div with border/padding, an inner row,
+            // a leaf. ~4 PaintNodes per entry — enough to make clone non-trivial.
+            let entries: Vec<View> = (0..N)
+                .map(|_i| {
+                    let producer: Box<dyn CellProducer> = Box::new(OneLine("x"));
+                    View::from(
+                        tags::div()
+                            .border_style(crate::style::BorderStyle::Round)
+                            .children(
+                                tags::div().children(
+                                    tags::div().children(
+                                        View::from_node(TuiNode::create_leaf_node(producer, 0))
+                                    )
+                                )
+                            )
+                    )
+                })
+                .collect();
+            // scroll mid-list: with ~3-rows-per-entry and viewport 30, scroll=1500
+            // puts us roughly halfway through the list.
+            let view: View = tags::div()
+                .width(W)
+                .height(VIEWPORT_H)
+                .overflow(taffy::style::Overflow::Hidden)
+                .scroll(1500i32)
+                .children(entries)
+                .into();
+            nodes = view.nodes.into_iter().collect();
+        });
+
+        // Warm-up: first render builds taffy, allocates, JIT-warms caches.
+        let _ = render(&nodes, Rect::new(0, 0, W as u16, VIEWPORT_H as u16), None);
+
+        const ITERS: u32 = 100;
+        let start = Instant::now();
+        for _ in 0..ITERS {
+            let _ = render(&nodes, Rect::new(0, 0, W as u16, VIEWPORT_H as u16), None);
+        }
+        let elapsed = start.elapsed();
+        let per = elapsed / ITERS;
+        println!(
+            "[bench_streaming_scroll] N={N} viewport={VIEWPORT_H} iters={ITERS} total={elapsed:?} per_render={per:?}"
         );
         root.dispose();
     }

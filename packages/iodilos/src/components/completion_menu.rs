@@ -71,6 +71,14 @@ pub fn completion_menu(props: CompletionMenuProps) -> View {
                         FlatRow::Body { item, is_selected, .. } => {
                             let label = item.label.clone();
                             let description = item.description.clone();
+                            // Selection paints the whole row's bg with the
+                            // highlight color and flips the label fg to Black
+                            // for contrast against yellow (Grey-on-Yellow is
+                            // hard to read). The `▶` marker prefixes the label
+                            // as an extra cue. The description's DarkGrey fg
+                            // is left alone — it stays a low-emphasis subtitle
+                            // on both states, and the bg alone is enough to
+                            // associate it with the selected row.
                             view! {
                                 div(
                                     flex_direction = FlexDirection::Row,

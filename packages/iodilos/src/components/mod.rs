@@ -15,7 +15,6 @@ use crate::view::{View, ViewTuiNode};
 
 pub mod completion_menu;
 pub mod iter;
-pub mod overlay_box;
 pub mod show;
 pub mod streaming_list;
 pub mod tabled;

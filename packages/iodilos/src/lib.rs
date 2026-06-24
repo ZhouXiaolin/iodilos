@@ -42,7 +42,6 @@ pub use components::completion_menu::{CompletionItem, CompletionMenuProps, compl
 pub use components::custom_element;
 pub use components::iter::{Indexed, IndexedProps, Keyed, KeyedProps};
 pub use components::show::{Show, ShowProps};
-pub use components::overlay_box::{OverlayBoxProps, OverlayGeometry, overlay_box};
 pub use components::streaming_list::{StreamingList, StreamingListProps};
 pub use components::tabled::{FlatRow, TableSection, Tabled, TabledProps};
 pub use events::{Event, EventKind};
@@ -86,7 +85,6 @@ pub mod prelude {
         CompletionItem, CompletionMenuProps, completion_menu,
     };
     pub use crate::components::iter::{Indexed, IndexedProps, Keyed, KeyedProps};
-    pub use crate::components::overlay_box::{OverlayBoxProps, OverlayGeometry, overlay_box};
     pub use crate::components::show::{Show, ShowProps};
     pub use crate::components::streaming_list::{StreamingList, StreamingListProps};
     pub use crate::components::tabled::{FlatRow, TableSection, Tabled, TabledProps};

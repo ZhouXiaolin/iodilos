@@ -62,12 +62,19 @@ pub fn statusline_runs(sl: &StatusLine, theme: &PromptTheme) -> BorderTitleRuns 
 /// The text starts at column 3 (after the 3-char left chrome), matching
 /// [`bottom_row`], so wrapping a long line never shifts the previous line left.
 fn flanked_row(content: &[Cell], inner_w: usize, bar_style: SpanStyle) -> Vec<Cell> {
+    // Layout: [│][ ][ ]<text...blanks...>[ ][ ][│] — symmetric 3-cell chrome
+    // on each side so wrapped lines line up with the bottom row's `╰─ ` /
+    // ` ─╯` decoration. The text band is `inner_w - 4` cells; shorter content
+    // pads with blanks.
     let mut row = Vec::with_capacity(inner_w + 2);
     row.push(row::glyph_cell('│', bar_style));
     row.push(row::glyph_cell(' ', bar_style));
     row.push(row::glyph_cell(' ', bar_style));
-    row::extend_clamped(&mut row, content, inner_w + 1);
-    row::pad(&mut row, inner_w + 1);
+    let text_end = inner_w.saturating_sub(1); // index of the last text-band cell + 1
+    row::extend_clamped(&mut row, content, text_end);
+    row::pad(&mut row, text_end);
+    row.push(row::glyph_cell(' ', bar_style));
+    row.push(row::glyph_cell(' ', bar_style));
     row.push(row::glyph_cell('│', bar_style));
     row
 }
@@ -77,17 +84,26 @@ fn flanked_row(content: &[Cell], inner_w: usize, bar_style: SpanStyle) -> Vec<Ce
 /// starts at the same column as [`flanked_row`]'s text so the caret never
 /// jumps when a line wraps.
 fn bottom_row(content: &[Cell], inner_w: usize, style: SpanStyle) -> Vec<Cell> {
-    // Layout: [╰][─][ ]<text...>[─ ─ ─][╯], content band is inner_w cells.
-    // The leading `─ ` consumes 2 of inner_w; the text fills the same column
-    // range as the flanked rows (after the 2-char left chrome + 1 space).
-    let text_w = inner_w.saturating_sub(2);
+    // Layout: [╰][─][ ]<text...blanks...>[ ][─][╯]. The left and right
+    // chrome are symmetric — `╰─ ` on the left and ` ─╯` on the right — so
+    // the dash decoration sits flush against each corner with one space of
+    // padding between it and the text band. The text band is `inner_w - 4`
+    // cells wide; anything shorter pads with blanks (NOT dashes — the dash
+    // run is just the corner decoration, not a fill-to-the-edge rule).
     let mut row = Vec::with_capacity(inner_w + 2);
     row.push(row::glyph_cell('╰', style));
     row.push(row::glyph_cell('─', style));
     row.push(row::glyph_cell(' ', style));
-    let text_max = row.len() + text_w;
-    row::extend_clamped(&mut row, content, text_max);
-    row::pad_with(&mut row, inner_w + 1, row::glyph_cell('─', style));
+    // `Spans::render` pads each row to its full width with `Cell::default()`
+    // (glyph = None), which renders as spaces. We pass `content` straight in;
+    // the band fills with blanks past the text. Reserve the trailing ` ─╯`
+    // (3 cells) by capping the extend at `inner_w - 1` (= `2 + (inner_w - 4) + 1`
+    // accounting for the leading 3-cell chrome already pushed and the band).
+    let text_end = inner_w.saturating_sub(1); // index where ` ` before `─╯` starts
+    row::extend_clamped(&mut row, content, text_end);
+    row::pad(&mut row, text_end);
+    row.push(row::glyph_cell(' ', style));
+    row.push(row::glyph_cell('─', style));
     row.push(row::glyph_cell('╯', style));
     row
 }
@@ -158,14 +174,13 @@ impl PromptView {
 
     /// Wrap the input runs to the content width and return the shaped rows.
     ///
-    /// The content width is `inner_w - 2`: the bottom row reserves a leading
-    /// `─ ` (2 cols) and the flanked rows reserve a matching `  ` indent, so
-    /// text starts at the same column on every line. Wrapping at this shared
-    /// width is what keeps a wrapped line from drifting left relative to the
-    /// cursor row. Reuses the framework's `Spans` producer for char-wrap +
-    /// `\n` + wide-glyph handling.
+    /// The content width is `inner_w - 4`: every input row reserves a 3-cell
+    /// chrome on each side (`╰─ `/`  │` on the bottom, `│  `/`  │` above),
+    /// so the text starts at the same column on every line and never drifts
+    /// when a line wraps. Reuses the framework's `Spans` producer for
+    /// char-wrap + `\n` + wide-glyph handling.
     fn input_rows(&self, inner_w: usize) -> Vec<Vec<Cell>> {
-        let content_w = inner_w.saturating_sub(2).max(1);
+        let content_w = inner_w.saturating_sub(4).max(1);
         Spans::new(self.input_runs.clone()).render(content_w)
     }
 }
@@ -206,8 +221,11 @@ impl CellProducer for PromptView {
     fn intrinsic_width(&self) -> usize {
         // The prompt fills its container width; report a nominal intrinsic
         // width so row-axis auto-sizing stays finite. Width is driven by the
-        // layout, not the content.
-        2 + self
+        // layout, not the content. The `4 +` accounts for the 3-cell chrome
+        // on each side (`╰─ `/` ─╯`) minus one for the right `─` that lives
+        // inside the same band on the bottom row — kept as a small finite
+        // baseline so a single-char input doesn't collapse the width.
+        4 + self
             .input_runs
             .iter()
             .map(|(s, _)| {
@@ -442,12 +460,12 @@ mod tests {
 
     #[test]
     fn measure_grows_with_wrapping() {
-        // A line longer than the content width (width - 2 frame - 2 indent)
-        // wraps to extra rows. Content rows wrap at inner_w - 2 columns.
+        // A line longer than the content width wraps to extra rows. The
+        // content band is `inner_w - 4` cells (3-cell chrome on each side).
         let v = view("abcdefghij", 10);
-        // width 8 → inner_w 6 → content_w 4 → 10 chars wrap to 3 rows (4+4+2)
-        // → 1 statusline + 3 = 4.
-        assert_eq!(v.measure(8), 4, "wrapped line grows height");
+        // width 8 → inner_w 6 → content_w 2 → 10 chars + 1 trailing cursor
+        // block wrap to 6 rows of 2 → 1 statusline + 6 = 7.
+        assert_eq!(v.measure(8), 7, "wrapped line grows height");
     }
 
     #[test]
@@ -466,6 +484,33 @@ mod tests {
         assert!(bottom.ends_with('╯'), "bottom-right corner: {bottom:?}");
         // The input 'a' sits on the bottom row, NOT a separate middle row.
         assert!(bottom.contains('a'), "input on the bottom row: {bottom:?}");
+    }
+
+    /// Regression for "right side of the input row shows trailing spaces
+    /// instead of `─╯`": with a short input like `"hi"` on a 20-cell row,
+    /// the row should be left/right symmetric — `╰─ hi   ...spaces...   ─╯` —
+    /// with the dash decoration sitting flush against each corner (one space
+    /// inboard) and the middle band padded with blanks, NOT dashes.
+    #[test]
+    fn render_bottom_row_is_symmetric_dash_decoration() {
+        let v = view("hi", 2);
+        let rows = v.render(20);
+        let bottom = row_text(&rows[1]);
+        assert!(bottom.starts_with("╰─ hi"), "left chrome `╰─ ` + text: {bottom:?}");
+        assert!(bottom.ends_with(" ─╯"), "right chrome ` ─╯`: {bottom:?}");
+        // The text band between left-chrome and right-chrome is blanks, not
+        // dashes — a stray `─` in the middle means the band fills with the
+        // corner decoration rather than padding with spaces.
+        let mid: String = bottom
+            .chars()
+            .skip_while(|&c| c != 'i')
+            .skip(1) // past 'i'
+            .take_while(|&c| c != '─') // up to the right-chrome dash
+            .collect();
+        assert!(
+            mid.chars().all(|c| c == ' '),
+            "middle band between text and right-chrome is blanks: {mid:?}"
+        );
     }
 
     #[test]

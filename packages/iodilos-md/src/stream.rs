@@ -40,6 +40,23 @@ use iodilos::producer::Lines;
 use iodilos::view::View;
 use crate::theme::MarkdownTheme;
 
+/// Result of [`StreamingParser::feed_with_split`]: the full block list for
+/// this tick plus the index that splits committed (cached) blocks from the
+/// open tail. `blocks[0..committed_count]` is the closed prefix; the rest is
+/// re-parsed every tick. [`StreamingSurface`] uses `committed_count` to know
+/// how much of its rendered-row cache is still valid.
+pub struct FeedResult {
+    /// The complete block list (committed prefix + open tail).
+    pub blocks: Vec<Block>,
+    /// Number of leading blocks that are the closed, cached prefix.
+    pub committed_count: usize,
+    /// `true` if the source was not an append-only extension of the previous
+    /// tick's source and the parser reset itself this tick. Render caches that
+    /// key off the committed prefix (e.g. [`StreamingSurface`]) must drop their
+    /// whole cache when this is set.
+    pub reset_happened: bool,
+}
+
 /// A stateful, append-only streaming Markdown parser.
 ///
 /// Create one with [`StreamingParser::new`] and call [`feed`](Self::feed) on
@@ -82,18 +99,19 @@ impl StreamingParser {
     }
 
     /// Feed the full current source and get back the complete block list for
-    /// this tick. The parser caches the closed prefix; only the open tail is
-    /// re-parsed.
-    ///
-    /// The source is assumed to be **append-only**: each call's source must
-    /// start with the previous call's source. If it does not (the content was
-    /// edited or replaced), the parser resets itself and re-parses from scratch.
-    pub fn feed(&mut self, src: &str) -> Vec<Block> {
+    /// this tick, **plus** the committed/tail split index. Same semantics as
+    /// [`feed`](Self::feed); prefer this from renderers (e.g.
+    /// [`StreamingSurface`]) that need to know which blocks are the cached
+    /// prefix so they can cache their rendered rows.
+    pub fn feed_with_split(&mut self, src: &str) -> FeedResult {
         // Detect a non-append-only change and reset. `take_while` on the shared
         // prefix tells us how much of the old committed source is still valid.
-        if !src.starts_with(self.committed_src.as_str()) {
+        let reset_happened = if !src.starts_with(self.committed_src.as_str()) {
             self.reset();
-        }
+            true
+        } else {
+            false
+        };
 
         // Advance the committed boundary over any newly-arrived blank-line
         // separators that sit outside an open fence.
@@ -141,7 +159,22 @@ impl StreamingParser {
         // when the `|` finally closes). See `absorb_streaming_table_rows`.
         absorb_streaming_table_rows(&mut all, committed_count);
         self.committed_blocks = all[..committed_count].to_vec();
-        all
+        FeedResult {
+            blocks: all,
+            committed_count,
+            reset_happened,
+        }
+    }
+
+    /// Feed the full current source and get back the complete block list for
+    /// this tick. The parser caches the closed prefix; only the open tail is
+    /// re-parsed.
+    ///
+    /// The source is assumed to be **append-only**: each call's source must
+    /// start with the previous call's source. If it does not (the content was
+    /// edited or replaced), the parser resets itself and re-parses from scratch.
+    pub fn feed(&mut self, src: &str) -> Vec<Block> {
+        self.feed_with_split(src).blocks
     }
 
     /// Feed the full current source, render the resulting blocks to a
@@ -230,8 +263,10 @@ impl StreamingParser {
         }
 
         let mut fence: Option<Fence> = None;
-        // Best candidate commit point: end-of-line index (exclusive) of a blank
-        // line we just saw, while not inside a fence.
+        // Best candidate commit point: end-of-line index (exclusive) past a
+        // line that closes a block — a blank line, a close fence, an ATX
+        // heading, a thematic rule, or a math close — while not inside an open
+        // fence.
         let mut best = start;
 
         let mut line_start = start;
@@ -240,13 +275,17 @@ impl StreamingParser {
             let line = &src[line_start..line_end];
             let trimmed_start = line.trim_start_matches(' ');
             let leading_spaces = line.len() - trimmed_start.len();
+            let line_past = step_past_newline(bytes, line_end);
 
             if let Some(open) = fence {
                 // Inside a code fence: only a matching close fence ends it.
                 if leading_spaces <= 3 && is_close_fence(trimmed_start, open) {
                     fence = None;
-                    // The close fence line is itself part of the code block; a
-                    // trailing blank line after it would be the real boundary.
+                    // Mechanism 2: a closed code fence is a settled block —
+                    // commit through the close-fence line's newline so the
+                    // whole fenced block enters the committed prefix and its
+                    // rows are cached (no per-tick re-render of the code).
+                    best = line_past;
                 }
                 // Any other line (including blanks) is code content: never a
                 // commit boundary while inside a fence.
@@ -263,15 +302,25 @@ impl StreamingParser {
                     // line *and* its terminating newline. `line_end` points AT
                     // the `\n`; advancing past it leaves the tail starting
                     // cleanly at the next line.
-                    best = step_past_newline(bytes, line_end);
+                    best = line_past;
                 }
-                // A non-blank, non-fence line is ordinary content (paragraph,
-                // heading, list, table row…). It may or may not close its block
-                // on this line, so it does not advance the boundary on its own.
+                // Any other non-blank line is ordinary content (paragraph,
+                // heading, list, table row…). It may still grow, so it does not
+                // advance the boundary on its own. (ATX headings, thematic
+                // rules, and display-math `$$` are also settled once their
+                // construct completes, but committing them early either causes
+                // streaming-height recessions — partial `#`/`# A` lines parse
+                // to a transient artefact that collapses when the line
+                // completes, see `table_streaming_height_never_recedes` — or,
+                // for `$$`, shares no clean open/close marker with the fence
+                // tracker. The performance win on these single-line blocks is
+                // negligible anyway; only fenced code blocks, whose open-close
+                // span is the real streaming hot spot, get the early-commit
+                // treatment.)
             }
 
             // Advance past this line (and its terminating newline, if any).
-            line_start = step_past_newline(bytes, line_end);
+            line_start = line_past;
             if line_start == line_end {
                 // No newline at line_end: we've consumed the final partial line.
                 break;
@@ -514,6 +563,48 @@ mod tests {
         );
         // The whole source ends in a blank line, so it should be fully committed.
         assert_eq!(p.committed_len(), src.len(), "fully committed");
+    }
+
+    #[test]
+    fn closed_fence_commits_without_trailing_blank_line() {
+        // Mechanism 2: a closed code fence settles its block immediately — no
+        // need to wait for a trailing blank line. So `...```\ntail` commits the
+        // whole fenced block the moment the close fence arrives; the tail is the
+        // following content.
+        let mut p = StreamingParser::new();
+        let src = "intro\n\n```rust\nfn x() {}\n```\nbody still streaming";
+        let _ = p.feed(src);
+        // The committed prefix must reach *past* the close fence (the ` ``` `
+        // line plus its newline), i.e. past `...```\n`, even though no blank
+        // line follows it.
+        let close_fence_end = src.find("```\n").map(|i| i + "```\n".len()).unwrap();
+        assert!(
+            p.committed_len() >= close_fence_end,
+            "close fence should commit immediately: committed_len={} < close_fence_end={}",
+            p.committed_len(),
+            close_fence_end
+        );
+    }
+
+    #[test]
+    fn closed_math_fence_commits_without_trailing_blank_line() {
+        // (Mechanism 2 was scoped down to fenced *code* only — display-math `$$`
+        // has no clean fence marker shared with the tracker, so it is not
+        // early-committed. This test documents that the math block is NOT
+        // committed early; it commits at the next blank line like before.)
+        let mut p = StreamingParser::new();
+        let src = "intro\n\n$$\\int_0^1 x\\,dx$$\nbody still streaming";
+        let _ = p.feed(src);
+        let close_end = src
+            .find("$$\n")
+            .map(|i| i + "$$\n".len())
+            .unwrap();
+        assert!(
+            p.committed_len() < close_end,
+            "math block should NOT early-commit (no trailing blank line yet): committed_len={}, close_end={}",
+            p.committed_len(),
+            close_end
+        );
     }
 
     #[test]

@@ -23,6 +23,12 @@ pub struct Highlighter {
 static SYNTAX_SET: OnceLock<SyntaxSet> = OnceLock::new();
 static THEME_SET: OnceLock<ThemeSet> = OnceLock::new();
 
+/// Test-only counter of `highlight_line` calls, used by the streaming-cost
+/// benchmark to quantify the open-fence re-highlight cost that T4b caches.
+#[cfg(test)]
+static HIGHLIGHT_CALL_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 impl Default for Highlighter {
     fn default() -> Self {
         // Eagerly initialize the global sets so the first render isn't slow.
@@ -43,6 +49,8 @@ impl Highlighter {
     /// `lang` is matched case-insensitively against syntect's known language
     /// extensions/names. Unknown languages fall back to plain output (no color).
     pub fn highlight_line(&self, line: &str, lang: &str) -> Vec<(String, Option<CrosstermColor>)> {
+        #[cfg(test)]
+        HIGHLIGHT_CALL_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let ss = match SYNTAX_SET.get() {
             Some(ss) => ss,
             None => return vec![(line.to_string(), None)],
@@ -100,6 +108,14 @@ impl Highlighter {
             out.push((line.to_string(), None));
         }
         out
+    }
+
+    /// Read the test-only global `highlight_line` call counter and reset it.
+    /// Exposed so streaming-cost benchmarks can measure the open-fence
+    /// re-highlight work that T4b caches away.
+    #[cfg(test)]
+    pub fn take_call_count() -> usize {
+        HIGHLIGHT_CALL_COUNT.swap(0, std::sync::atomic::Ordering::Relaxed)
     }
 }
 

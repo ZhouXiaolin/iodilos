@@ -12,6 +12,7 @@ pub mod mermaid;
 pub mod parser;
 pub mod render;
 pub mod stream;
+pub mod streaming_surface;
 pub mod theme;
 pub mod view;
 mod wrap;
@@ -19,7 +20,8 @@ mod wrap;
 pub use highlight::Highlighter;
 pub use parser::{Block, Inline, List, ListItem, Table, parse, parse_with_theme};
 pub use render::{render_blocks_to_surface, render_to_surface};
-pub use stream::StreamingParser;
+pub use stream::{FeedResult, StreamingParser};
+pub use streaming_surface::{Row, StreamingSurface};
 pub use theme::MarkdownTheme;
 pub use view::{blocks_height, blocks_to_view};
 

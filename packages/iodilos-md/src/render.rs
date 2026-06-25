@@ -66,6 +66,22 @@ fn render_block(
     }
 }
 
+/// Render a single top-level block into `out` (blockquote depth 0). Public so
+/// the streaming surface can render individual tail blocks itself — letting it
+/// route code blocks through the cached-highlight path (T4b) while every other
+/// block type uses the normal renderer. Output is byte-identical to what
+/// `render_blocks_to_surface` would have produced for that block.
+pub fn render_block_into(
+    block: &Block,
+    width: usize,
+    theme: &MarkdownTheme,
+    hl: &Highlighter,
+    out: &mut Vec<Vec<(String, SpanStyle)>>,
+) {
+    render_block(block, width, theme, hl, 0, out);
+}
+
+
 /// Flatten inlines to a single owned string: headings use it for single-style
 /// text, and the streaming path uses it to read a paragraph as plain text.
 pub(crate) fn inlines_to_string(inlines: &[Inline]) -> String {
@@ -337,32 +353,60 @@ fn render_code_block(
     out: &mut Vec<Vec<(String, SpanStyle)>>,
 ) {
     let lang_str = lang.as_deref().unwrap_or("");
+    // Pre-compute per-line highlights, then hand off to the pre-highlighted
+    // entry point. The streaming surface caches this `highlights` Vec across
+    // ticks (T4b), so it calls the entry point directly and only re-highlights
+    // the dirty tail line instead of every line each tick.
+    let highlights: Vec<Vec<(String, Option<Color>)>> = code
+        .lines()
+        .chain((code.is_empty()).then_some(""))
+        .map(|line| hl.highlight_line(line, lang_str))
+        .collect();
+    render_code_block_with_highlights(lang_str, &highlights, width, theme, out);
+}
+
+/// Render a code block from **pre-computed** per-line highlights, skipping the
+/// `Highlighter` entirely. This is the T4b entry point: the streaming surface
+/// caches the stable lines' highlights across ticks and reuses them, so only
+/// the dirty (last, still-streaming) line pays for `highlight_line` each tick.
+///
+/// `lang_str` is the raw fence info-string (may be empty). `highlights[i]` must
+/// correspond to line `i` of the code, in the same iteration order as
+/// `code.lines().chain((code.is_empty()).then_some(""))`.
+pub fn render_code_block_with_highlights(
+    lang_str: &str,
+    highlights: &[Vec<(String, Option<Color>)>],
+    width: usize,
+    theme: &MarkdownTheme,
+    out: &mut Vec<Vec<(String, SpanStyle)>>,
+) {
     let label = if lang_str.trim().is_empty() {
         "text"
     } else {
         lang_str.trim()
     };
-    let mut body = Vec::new();
-    for line in code.lines().chain((code.is_empty()).then_some("")) {
-        let tokens = hl.highlight_line(line, lang_str);
-        body.push(if tokens.is_empty() {
-            vec![("".to_string(), SpanStyle::default())]
-        } else {
-            tokens
-                .into_iter()
-                .map(|(text, color)| {
-                    let style = match color {
-                        Some(c) => SpanStyle {
-                            fg: Some(c),
-                            ..SpanStyle::default()
-                        },
-                        None => SpanStyle::default(),
-                    };
-                    (text, style)
-                })
-                .collect()
-        });
-    }
+    let body: Vec<Vec<(String, SpanStyle)>> = highlights
+        .iter()
+        .map(|tokens| {
+            if tokens.is_empty() {
+                vec![("".to_string(), SpanStyle::default())]
+            } else {
+                tokens
+                    .iter()
+                    .map(|(text, color)| {
+                        let style = match color {
+                            Some(c) => SpanStyle {
+                                fg: Some(*c),
+                                ..SpanStyle::default()
+                            },
+                            None => SpanStyle::default(),
+                        };
+                        (text.clone(), style)
+                    })
+                    .collect()
+            }
+        })
+        .collect();
     render_framed_block(
         Some(label),
         body,
